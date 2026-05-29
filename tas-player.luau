@@ -329,8 +329,8 @@ local DelayedMaps = {
 }
 
 if DelayedMaps[realMapName] then
-    Log("Map delay active: waiting 0.8s before playback...", "Warning")
-    task.wait(0.8)
+    Log("Map delay active: waiting 0.7s before playback...", "Warning")
+    task.wait(0.7)
 end
 
 local TimeStart = os.clock()
@@ -417,12 +417,15 @@ end
 local LastSyncTime = os.clock()
 local SyncInterval = 3 -- check every 3 seconds
 local SyncThreshold = 0.05 -- only correct if drift is more than 50ms
+local MapStartDelay = DelayedMaps[realMapName] and 0.8 or 0
 
 local function TrySync()
     local gameTimer = GetGameTimer()
     if not gameTimer then return end
+    -- subtract the map start delay so it isn't counted as drift
+    local adjustedTimer = gameTimer - MapStartDelay
     local tasTimer = os.clock() - TimeStart
-    local drift = tasTimer - gameTimer
+    local drift = tasTimer - adjustedTimer
     if math.abs(drift) > SyncThreshold then
         TimeStart = TimeStart + drift
         Log(string.format("Auto-sync: corrected %.3fs drift.", drift), "Warning")
