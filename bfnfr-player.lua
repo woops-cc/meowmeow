@@ -9,7 +9,7 @@ local C_BG     = Color3.fromRGB(18,  18,  22)
 -- ── Window ────────────────────────────────────
 local window = lib:Window("w0opsie_ap", {
     Title    = "<font color='#5BC8F5'>w0</font><font color='#F5A623'>o</font><font color='#5BC8F5'>opsie's ap</font>",
-    Icon     = "rbxassetid://0",  -- ← swap with your oc asset id
+    Icon     = "rbxassetid://71140941882804",  -- ← swap with your oc asset id
     Footer   = "<font color='#5BC8F5'>Basically FNF: Remix</font>",
     Keybind  = Enum.KeyCode.RightShift,
     NeonType      = "Top",
