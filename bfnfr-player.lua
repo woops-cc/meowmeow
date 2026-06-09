@@ -1,39 +1,55 @@
-local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/woops-cc/private/refs/heads/main/Library.lua"))()
+local lib = loadstring(game:HttpGet("https://raw.githubusercontent.com/Null-Cherry/Fire-Library/refs/heads/main/Loader.lua", true))()
 
--- OC colors: sky blue #5BC8F5, orange/gold #F5A623, white #FFFFFF
-Library.Theme["Accent"]             = Color3.fromRGB(91, 200, 245)   -- sky blue
-Library.Theme["Window Background"]  = Color3.fromRGB(18, 18, 22)
-Library.Theme["Section Background"] = Color3.fromRGB(12, 12, 16)
-Library.Theme["Inline"]             = Color3.fromRGB(10, 10, 14)
-Library.Theme["Element"]            = Color3.fromRGB(40, 40, 50)
-Library.Theme["Border"]             = Color3.fromRGB(91, 200, 245)
-Library.Theme["Text"]               = Color3.fromRGB(220, 220, 220)
+-- ── OC palette ────────────────────────────────
+local C_BLUE   = Color3.fromRGB(91,  200, 245)  -- sky blue  #5BC8F5
+local C_ORANGE = Color3.fromRGB(245, 166, 35)   -- gold      #F5A623
+local C_WHITE  = Color3.fromRGB(220, 220, 225)
 
--- ──────────────────────────────────────────────
--- Services & config
--- ──────────────────────────────────────────────
-local v0 = game:GetService("RunService")
-local v1 = game:GetService("VirtualInputManager")
-local v2 = game:GetService("Players")
+-- ── Window ────────────────────────────────────
+local window = lib:Window("w0opsie_ap", {
+    Title              = "<font color='#5BC8F5'>w</font><font color='#6DCEF5'>0</font><font color='#7FD5F5'>o</font><font color='#F5A623'>o</font><font color='#F5B83A'>p</font><font color='#5BC8F5'>s</font><font color='#5BC8F5'>i</font><font color='#F5A623'>e</font><font color='#5BC8F5'>'s ap</font>",
+    Icon               = "rbxassetid://0",  -- ← swap with your oc art asset id when ready
+    Footer             = "Basically FNF: Remix",
+    Keybind            = Enum.KeyCode.RightShift,
+    NeonType           = "Top",
+    NeonThickness      = 2,
+    AnimationSpeed     = 1.2,
+    ShadowTransparency = 0.5,
+    ShadowSize         = 18,
+    Theme = {
+        Back   = Color3.fromRGB(18,  18,  22),   -- dark background
+        Main   = C_BLUE,                          -- accent = sky blue
+        Stroke = C_ORANGE,                        -- border glow = orange
+        Text   = C_WHITE,
+    },
+})
+
+-- ── Services ──────────────────────────────────
+local RunService = game:GetService("RunService")
+local VIM        = game:GetService("VirtualInputManager")
+local Players    = game:GetService("Players")
 
 local v4 = {
-    KeyBinds    = {[1] = Enum.KeyCode.A, [2] = Enum.KeyCode.S, [3] = Enum.KeyCode.W, [4] = Enum.KeyCode.D},
+    KeyBinds    = {Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.W, Enum.KeyCode.D},
     HitPixels   = 15,
     TapDuration = 0.05,
 }
 
-local v5           = v2.LocalPlayer
-local v6           = {}
-local v7           = {}
-local v8           = false
-local missJacks    = false
-local mainLoop     = nil
-local holdCache    = {}
-local cacheBuilt   = {}
-local heldKeys     = {}
+local v5         = Players.LocalPlayer
+local v6         = {}
+local v7         = {}
+local v8         = false
+local missJacks  = false
+local legitMode  = false
+local perfected  = false
+local mainLoop   = nil
+local holdCache  = {}
+local cacheBuilt = {}
+local heldKeys   = {}
 
 local minReaction   = 0
 local maxReaction   = 0
+local legitKpsLimit = 100
 local perfectChance = 100
 local sickChance    = 0
 local goodChance    = 0
@@ -43,237 +59,250 @@ local missChance    = 0
 local platformContent    = "😇"
 local platformAutoRejoin = true
 
+-- KPS tracking for legit mode
+local kpsLog  = {}
+local kpsLock = false
+
 local function pressKey(key)
     if not heldKeys[key] then
         heldKeys[key] = true
-        v1:SendKeyEvent(true, key, false, game)
+        VIM:SendKeyEvent(true, key, false, game)
     end
 end
-
 local function releaseKey(key)
     if heldKeys[key] then
         heldKeys[key] = nil
-        v1:SendKeyEvent(false, key, false, game)
+        VIM:SendKeyEvent(false, key, false, game)
     end
 end
 
--- ──────────────────────────────────────────────
--- Window
--- ──────────────────────────────────────────────
-local Window = Library:Window({
-    Name = "w0opsie's ap",
-    GradientTitle = {
-        Enabled = true,
-        Start   = Color3.fromRGB(91, 200, 245),   -- sky blue
-        Middle  = Color3.fromRGB(245, 166, 35),   -- orange/gold
-        End     = Color3.fromRGB(91, 200, 245),   -- back to blue
-        Speed   = 1
-    }
-})
+-- ── Tabs ──────────────────────────────────────
+local mainTab     = window:AddTab("MainTab",     { Text = "⚙ Main"     })
+local platformTab = window:AddTab("PlatformTab", { Text = "🎭 Platform" })
+local settingsTab = window:AddTab("SettingsTab", { Text = "🎨 Settings" })
 
--- ──────────────────────────────────────────────
--- OC toggle button (Sharp Cube)
--- ──────────────────────────────────────────────
-task.defer(function()
-    local holder = Library.Holder and Library.Holder.Instance
-    if not holder then return end
+-- ── Groupboxes ────────────────────────────────
+local apGroup      = mainTab:AddLeftGroupbox( "APGroup",      { Text = "Auto Player"     })
+local playerGroup  = mainTab:AddLeftGroupbox( "PlayerGroup",  { Text = "Player Settings" })
+local chanceGroup  = mainTab:AddRightGroupbox("ChanceGroup",  { Text = "Hit Chances"     })
+local platformGroup = platformTab:AddLeftGroupbox("PlatGroup", { Text = "Platform Display" })
+local themeGroup   = settingsTab:AddLeftGroupbox("ThemeGroup", { Text = "Theme"           })
 
-    local windowFrame
-    for _, c in ipairs(holder:GetChildren()) do
-        if (c:IsA("Frame") or c:IsA("TextButton")) and c.AbsoluteSize.X > 100 then
-            windowFrame = c
-            break
-        end
-    end
-    if not windowFrame then return end
-
-    local uiVisible = true
-
-    -- Base Cube matching Section Background
-    local btn = Instance.new("ImageButton")
-    btn.Name          = "OCToggleBtn"
-    btn.Size          = UDim2.new(0, 45, 0, 45)
-    btn.Position      = UDim2.new(1, -60, 0, 15)
-    btn.AnchorPoint   = Vector2.new(0, 0)
-    btn.BackgroundColor3 = Color3.fromRGB(12, 12, 16) 
-    btn.BorderSizePixel  = 0
-    btn.ZIndex        = 999
-    btn.Parent        = holder
-
-    -- Sharp Border matching UI outline
-    local stroke = Instance.new("UIStroke")
-    stroke.Color     = Color3.fromRGB(68, 68, 68) 
-    stroke.Thickness = 2
-    stroke.LineJoinMode = Enum.LineJoinMode.Miter
-    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-    stroke.Parent    = btn
-
-    -- OC Icon
-    local icon = Instance.new("ImageLabel")
-    icon.Size             = UDim2.new(0.8, 0, 0.8, 0)
-    icon.Position         = UDim2.new(0.1, 0, 0.1, 0)
-    icon.BackgroundTransparency = 1
-    icon.Image            = "rbxassetid://133412738038266" 
-    icon.ScaleType        = Enum.ScaleType.Fit
-    icon.ZIndex           = 1000
-    icon.Parent           = btn
-
-    -- Top bar accent matching OC Blue
-    local topbar = Instance.new("Frame")
-    topbar.Size              = UDim2.new(1, 0, 0, 2)
-    topbar.Position          = UDim2.new(0, 0, 0, 0)
-    topbar.BorderSizePixel   = 0
-    topbar.BackgroundColor3  = Color3.fromRGB(91, 200, 245)
-    topbar.ZIndex            = 1001
-    topbar.Parent            = btn
-
-    btn.MouseButton1Click:Connect(function()
-        uiVisible = not uiVisible
-        windowFrame.Visible = uiVisible
-        stroke.Color = uiVisible and Color3.fromRGB(91, 200, 245) or Color3.fromRGB(68, 68, 68)
-    end)
-end)
-
--- ──────────────────────────────────────────────
--- Single page — Main (everything merged here)
--- ──────────────────────────────────────────────
-local MainPage = Window:Page({Name = "Main", Columns = 2})
-
--- LEFT column
-local apSection     = MainPage:Section({Name = "Auto Player",     Side = 1})
-local playerSection = MainPage:Section({Name = "Player Settings", Side = 1})
-local miscSection   = MainPage:Section({Name = "Platform",        Side = 1})
-
--- RIGHT column
-local chanceSection = MainPage:Section({Name = "Hit Chances", Side = 2})
-
--- Settings page
-local SettingsPage  = Window:Page({Name = "Settings", Columns = 2})
-
--- ──────────────────────────────────────────────
--- Auto Player
--- ──────────────────────────────────────────────
-apSection:Toggle({
-    Name     = "Enable",
-    Flag     = "AutoPlayer_Enabled",
-    Default  = false,
+-- ── Auto Player ───────────────────────────────
+apGroup:AddToggle("AutoPlayerEnabled", {
+    Text    = "Enable",
+    Value   = false,
+    Tooltip = "Enables the auto player",
     Callback = function(val)
         v8 = val
         if v8 then
-            holdCache  = {}
-            cacheBuilt = {}
-            for _, key in pairs(v4.KeyBinds) do releaseKey(key) end
+            holdCache = {}; cacheBuilt = {}
+            for _, k in pairs(v4.KeyBinds) do releaseKey(k) end
             startLoop()
-            Library:Notification("AutoPlayer ON", 2, Color3.fromRGB(91, 200, 245))
+            window:Notification({ Title = "AutoPlayer", Text = "Turned ON", Duration = 2 })
         else
-            for _, key in pairs(v4.KeyBinds) do releaseKey(key) end
+            for _, k in pairs(v4.KeyBinds) do releaseKey(k) end
             if mainLoop then mainLoop:Disconnect() end
-            Library:Notification("AutoPlayer OFF", 2, Color3.fromRGB(245, 166, 35))
+            window:Notification({ Title = "AutoPlayer", Text = "Turned OFF", Duration = 2 })
         end
     end,
 })
 
-apSection:Toggle({
-    Name     = "Miss Jack Notes",
-    Flag     = "MissJacks",
-    Default  = false,
+apGroup:AddToggle("MissJacks", {
+    Text     = "Miss Jack Notes",
+    Value    = false,
+    Tooltip  = "Skips jack notes intentionally",
     Callback = function(val) missJacks = val end,
 })
 
--- ──────────────────────────────────────────────
--- Player Settings
--- ──────────────────────────────────────────────
-playerSection:Slider({
-    Name     = "Min Reaction",
-    Flag     = "MinReaction",
-    Min      = 0,
-    Max      = 150,
-    Default  = 0,
-    Decimals = 0,
-    Suffix   = "ms",
-    Callback = function(val) minReaction = math.floor(tonumber(val) or 0) end,
+apGroup:AddSeparator("Sep1", {})
+
+apGroup:AddToggle("LegitMode", {
+    Text    = "Legit Mode",
+    Value   = false,
+    Tooltip = "Limits KPS and makes hits more human-like",
+    Callback = function(val)
+        legitMode = val
+        if val then
+            -- When legit mode is on, bias toward sick/good ratings
+            perfectChance = 40
+            sickChance    = 40
+            goodChance    = 15
+            okChance      = 4
+            badChance     = 1
+            missChance    = 0
+        else
+            -- Restore whatever the sliders say
+            -- (callbacks will fire again on next slider interaction;
+            --  for now just reset to full perfect)
+            perfectChance = 100
+            sickChance    = 0
+            goodChance    = 0
+            okChance      = 0
+            badChance     = 0
+            missChance    = 0
+        end
+        window:Notification({
+            Title = "Legit Mode",
+            Text  = val and "ON — KPS capped at "..legitKpsLimit or "OFF",
+            Duration = 2
+        })
+    end,
 })
 
-playerSection:Slider({
-    Name     = "Max Reaction",
-    Flag     = "MaxReaction",
-    Min      = 0,
-    Max      = 150,
-    Default  = 0,
-    Decimals = 0,
-    Suffix   = "ms",
-    Callback = function(val) maxReaction = math.floor(tonumber(val) or 0) end,
+apGroup:AddSlider("LegitKpsLimit", {
+    Text    = "KPS Limit",
+    Min     = 1,
+    Max     = 100,
+    Value   = 100,
+    Step    = 1,
+    Format  = "/",
+    Tooltip = "Maximum key presses per second in Legit Mode",
+    Callback = function(val) legitKpsLimit = val end,
 })
 
--- ──────────────────────────────────────────────
--- Platform (misc merged into left column)
--- ──────────────────────────────────────────────
-miscSection:Toggle({
-    Name     = "Custom Platform Display",
-    Flag     = "PlatformAutoRejoin",
-    Default  = true,
+apGroup:AddSeparator("Sep2", {})
+
+apGroup:AddToggle("Perfected", {
+    Text    = "Perfected",
+    Value   = false,
+    Tooltip = "Attempts to hit every note at exactly 0ms reaction time",
+    Callback = function(val)
+        perfected = val
+        if val then
+            minReaction = 0
+            maxReaction = 0
+        end
+        window:Notification({
+            Title = "Perfected",
+            Text  = val and "ON — hitting at 0ms" or "OFF",
+            Duration = 2
+        })
+    end,
+})
+
+-- ── Player Settings ───────────────────────────
+playerGroup:AddSlider("MinReaction", {
+    Text    = "Min Reaction",
+    Min     = 0,
+    Max     = 150,
+    Value   = 0,
+    Step    = 1,
+    Format  = "/",
+    Tooltip = "Minimum reaction time delay in ms",
+    Callback = function(val)
+        if not perfected then minReaction = math.floor(val) end
+    end,
+})
+
+playerGroup:AddSlider("MaxReaction", {
+    Text    = "Max Reaction",
+    Min     = 0,
+    Max     = 150,
+    Value   = 0,
+    Step    = 1,
+    Format  = "/",
+    Tooltip = "Maximum reaction time delay in ms",
+    Callback = function(val)
+        if not perfected then maxReaction = math.floor(val) end
+    end,
+})
+
+-- ── Hit Chances ───────────────────────────────
+chanceGroup:AddSlider("PerfectChance", {
+    Text = "Perfect Chance", Min = 0, Max = 100, Value = 100, Step = 1,
+    Tooltip = "Chance of hitting a Perfect",
+    Callback = function(val) if not legitMode then perfectChance = math.floor(val) end end,
+})
+chanceGroup:AddSlider("SickChance", {
+    Text = "Sick Chance", Min = 0, Max = 100, Value = 0, Step = 1,
+    Tooltip = "Chance of hitting a Sick",
+    Callback = function(val) if not legitMode then sickChance = math.floor(val) end end,
+})
+chanceGroup:AddSlider("GoodChance", {
+    Text = "Good Chance", Min = 0, Max = 100, Value = 0, Step = 1,
+    Tooltip = "Chance of hitting a Good",
+    Callback = function(val) if not legitMode then goodChance = math.floor(val) end end,
+})
+chanceGroup:AddSlider("OkChance", {
+    Text = "Ok Chance", Min = 0, Max = 100, Value = 0, Step = 1,
+    Tooltip = "Chance of hitting an Ok",
+    Callback = function(val) if not legitMode then okChance = math.floor(val) end end,
+})
+chanceGroup:AddSlider("BadChance", {
+    Text = "Bad Chance", Min = 0, Max = 100, Value = 0, Step = 1,
+    Tooltip = "Chance of hitting a Bad",
+    Callback = function(val) if not legitMode then badChance = math.floor(val) end end,
+})
+chanceGroup:AddSlider("MissChance", {
+    Text = "Miss Chance", Min = 0, Max = 100, Value = 0, Step = 1,
+    Tooltip = "Chance of missing a note intentionally",
+    Callback = function(val) if not legitMode then missChance = math.floor(val) end end,
+})
+
+-- ── Platform tab ──────────────────────────────
+platformGroup:AddToggle("PlatformAutoRejoin", {
+    Text     = "Custom Platform Display",
+    Value    = true,
     Callback = function(val) platformAutoRejoin = val end,
 })
 
-miscSection:Textbox({
-    Name        = "Display Content",
-    Flag        = "PlatformContent",
-    Default     = "😇",
-    Placeholder = "Enter text or emoji...",
-    Callback    = function(val)
+platformGroup:AddTextBox("PlatformContent", {
+    Text            = "Display Content",
+    Value           = "😇",
+    PlaceholderText = "Enter text or emoji...",
+    Callback        = function(val)
         if val and val ~= "" then platformContent = val end
     end,
 })
 
-miscSection:Button({
-    Name     = "Apply Platform Display",
+platformGroup:AddButton("ApplyPlatform", {
+    Text = "Apply Platform Display",
     Callback = function()
         if game.PlaceId ~= 6520999642 then
-            Library:Notification("Wrong game!", 3, Color3.fromRGB(255, 80, 80))
-            return
+            window:Notification({ Title = "Error", Text = "Wrong game!", Duration = 3 }); return
         end
         if not (isfile and readfile and writefile) then
-            Library:Notification("Incompatible executor!", 3, Color3.fromRGB(255, 80, 80))
-            return
+            window:Notification({ Title = "Error", Text = "Incompatible executor!", Duration = 3 }); return
         end
         local QueueOnTP = (syn and syn.queue_on_teleport)
             or (fluxus and fluxus.queue_on_teleport)
             or (queue_on_teleport and queue_on_teleport)
         if not QueueOnTP then
-            Library:Notification("Missing queue_on_teleport!", 3, Color3.fromRGB(255, 80, 80))
-            return
+            window:Notification({ Title = "Error", Text = "Missing queue_on_teleport!", Duration = 3 }); return
         end
+
         local Content = platformContent
         writefile("FNFRemixDisplayContent.txt", tostring(Content))
-        local StarterGui = game:GetService("StarterGui")
-        local Players    = game:GetService("Players")
-        local TPService  = game:GetService("TeleportService")
-        local Speaker    = Players.LocalPlayer
+
+        local SG  = game:GetService("StarterGui")
+        local P   = game:GetService("Players")
+        local TPS = game:GetService("TeleportService")
+        local Spk = P.LocalPlayer
+
         local function Alert()
-            local Sound = Instance.new("Sound", game:GetService("SoundService"))
-            Sound.Volume = 2;
-            Sound.SoundId = "rbxassetid://4590662766"
-            Sound.PlayOnRemove = true;
-            Sound:Destroy()
+            local s = Instance.new("Sound", game:GetService("SoundService"))
+            s.Volume = 2; s.SoundId = "rbxassetid://4590662766"
+            s.PlayOnRemove = true; s:Destroy()
         end
+
         if _G.FNFRemixACPD or (getgenv and getgenv().FNFRemixACPD) then
-            StarterGui:SetCore("SendNotification", {Title="🧐 Changed!", Text="Display: '"..Content.."'", Duration=5})
-            Library:Notification("Content: "..Content, 4, Color3.fromRGB(91,200,245))
-            Alert();
-            return
+            SG:SetCore("SendNotification", { Title="🧐 Changed!", Text="Display: '"..Content.."'", Duration=5 })
+            window:Notification({ Title = "Platform", Text = "Content: "..Content, Duration = 4 })
+            Alert(); return
         end
+
         local Rejoin = Instance.new("BindableFunction")
-        Rejoin.OnInvoke = function(Answer)
-            if Answer == "Yes" and platformAutoRejoin then
-                if #Players:GetPlayers() <= 1 then
-                    Speaker:Kick("\nRejoining...");
-                    task.wait()
-                    TPService:Teleport(6520999642, Speaker)
+        Rejoin.OnInvoke = function(Ans)
+            if Ans == "Yes" and platformAutoRejoin then
+                if #P:GetPlayers() <= 1 then
+                    Spk:Kick("\nRejoining..."); task.wait(); TPS:Teleport(6520999642, Spk)
                 else
-                    TPService:TeleportToPlaceInstance(6520999642, game.JobId, Speaker)
+                    TPS:TeleportToPlaceInstance(6520999642, game.JobId, Spk)
                 end
             end
         end
+
         QueueOnTP([[
             if game.PlaceId ~= 6520999642 then return end
             if not (isfile and readfile) then return end
@@ -289,253 +318,216 @@ miscSection:Button({
             end)
             game:GetService'ReplicatedStorage':WaitForChild'Remotes':WaitForChild'PlatformRemoteEvent':FireServer(tostring(Content))
         ]])
-        StarterGui:SetCore("SendNotification", {
-            Title=platformAutoRejoin and "🧐 Rejoin?" or "🧐 Done",
-            Text=platformAutoRejoin and "Rejoin to apply '"..Content.."'?" or "Rejoin manually to apply.",
-            Button1="Yes", Button2="No", Duration=(1/0), Callback=Rejoin
+
+        SG:SetCore("SendNotification", {
+            Title    = platformAutoRejoin and "🧐 Rejoin?" or "🧐 Done",
+            Text     = platformAutoRejoin and "Rejoin to apply '"..Content.."'?" or "Rejoin manually.",
+            Button1  = "Yes", Button2 = "No",
+            Duration = (1/0), Callback = Rejoin,
         })
         Alert()
-        Library:Notification("Platform set: "..Content, 4, Color3.fromRGB(91,200,245))
+        window:Notification({ Title = "Platform", Text = "Set: "..Content, Duration = 4 })
         if getgenv then getgenv().FNFRemixACPD = true else _G.FNFRemixACPD = true end
     end,
 })
 
--- ──────────────────────────────────────────────
--- Hit Chances (right column)
--- ──────────────────────────────────────────────
-chanceSection:Slider({
-    Name="Perfect Chance", Flag="PerfectChance", Min=0, Max=100, Default=100,
-    Decimals=0, Suffix="%",
-    Callback=function(val) perfectChance = math.floor(tonumber(val) or 100) end,
-})
-chanceSection:Slider({
-    Name="Sick Chance", Flag="SickChance", Min=0, Max=100, Default=0,
-    Decimals=0, Suffix="%",
-    Callback=function(val) sickChance = math.floor(tonumber(val) or 0) end,
-})
-chanceSection:Slider({
-    Name="Good Chance", Flag="GoodChance", Min=0, Max=100, Default=0,
-    Decimals=0, Suffix="%",
-    Callback=function(val) goodChance = math.floor(tonumber(val) or 0) end,
-})
-chanceSection:Slider({
-    Name="Ok Chance", Flag="OkChance", Min=0, Max=100, Default=0,
-    Decimals=0, Suffix="%",
-    Callback=function(val) okChance = math.floor(tonumber(val) or 0) end,
-})
-chanceSection:Slider({
-    Name="Bad Chance", Flag="BadChance", Min=0, Max=100, Default=0,
-    Decimals=0, Suffix="%",
-    Callback=function(val) badChance = math.floor(tonumber(val) or 0) end,
-})
-chanceSection:Slider({
-    Name="Miss Chance", Flag="MissChance", Min=0, Max=100, Default=0,
-    Decimals=0, Suffix="%",
-    Callback=function(val) missChance = math.floor(tonumber(val) or 0) end,
+-- ── Settings tab — theme picker ───────────────
+themeGroup:AddLabel("ThemeLabel1", { Text = "Main accent (sky blue = default)" })
+themeGroup:AddColorPicker("ThemeMain", {
+    Text  = "Accent Color",
+    Value = C_BLUE,
+    Callback = function(val)
+        window.Theme = { Back = Color3.fromRGB(18,18,22), Main = val, Stroke = C_ORANGE, Text = C_WHITE }
+        window:Refresh()
+    end,
 })
 
--- ──────────────────────────────────────────────
--- Settings page
--- ──────────────────────────────────────────────
-local ThemesSection  = SettingsPage:Section({Name = "Themes",  Side = 1})
-local ConfigsSection = SettingsPage:Section({Name = "Configs", Side = 2})
+themeGroup:AddLabel("ThemeLabel2", { Text = "Stroke / glow (orange = default)" })
+themeGroup:AddColorPicker("ThemeStroke", {
+    Text  = "Stroke Color",
+    Value = C_ORANGE,
+    Callback = function(val)
+        window.Theme = { Back = Color3.fromRGB(18,18,22), Main = C_BLUE, Stroke = val, Text = C_WHITE }
+        window:Refresh()
+    end,
+})
 
-do
-    for Index, Value in Library.Theme do
-        Library.ThemeColorpickers[Index] = ThemesSection:Label(Index, "Left"):Colorpicker({
-            Name=Index, Flag="Theme"..Index, Default=Value,
-            Callback=function(v) Library.Theme[Index]=v;
-Library:ChangeTheme(Index,v) end
-        })
-    end
-    ThemesSection:Dropdown({
-        Name="Preset Themes", Items={"Default","Bitchbot","Onetap","Aqua"}, Default="Default",
-        Callback=function(v)
-            local d = Library.Themes[v]; if not d then return end
-            for i, val in Library.Theme do
-                Library.Theme[i]=d[i]; Library:ChangeTheme(i,d[i])
-                Library.ThemeColorpickers[i]:Set(d[i])
-            end
-        end
-    })
-end
-
-do
-    local ConfigName, SelectedConfig = "", nil
-    local ConfigsListbox = ConfigsSection:Listbox({
-        Name="Saved Configs", Flag="ConfigsList", Items={}, Multi=false, Default=nil,
-        Callback=function(v) SelectedConfig=v end
-    })
-    ConfigsSection:Textbox({Name="Config Name",Flag="ConfigName",Default="",Placeholder="Name...",
-        Callback=function(v) ConfigName=v end})
-    ConfigsSection:Button({Name="Save Config", Callback=function()
-        if ConfigName=="" then return end
-        local p=Library.Folders.Configs.."/"..ConfigName..".json"
-        if not isfile(p) then writefile(p,Library:GetConfig());
-Library:RefreshConfigsList(ConfigsListbox)
-        else Library:Notification("Already exists!",3,Color3.fromRGB(255,80,80)) end
-    end}):SubButton({Name="Load Config", Callback=function()
-        if SelectedConfig then Library:LoadConfig(readfile(Library.Folders.Configs.."/"..SelectedConfig)) end
-    end})
-    ConfigsSection:Button({Name="Delete Config", Callback=function()
-        if SelectedConfig then Library:DeleteConfig(SelectedConfig); Library:RefreshConfigsList(ConfigsListbox) end
-    end}):SubButton({Name="Refresh", Callback=function() Library:RefreshConfigsList(ConfigsListbox) end})
-    Library:RefreshConfigsList(ConfigsListbox)
-end
-
--- ──────────────────────────────────────────────
--- HOLD CACHE
--- ──────────────────────────────────────────────
-local function buildHoldCache(notesFolder)
-    local normalNotes, holdNotes = {}, {}
-    for _, obj in pairs(notesFolder:GetChildren()) do
-        if not obj:IsA("GuiObject") then continue end
-        if obj.Name:sub(1,5) == "Hold_" then
-            local num = tonumber(obj.Name:sub(6))
-            if num then table.insert(holdNotes, {num=num, obj=obj}) end
-        elseif tonumber(obj.Name) then
-            table.insert(normalNotes, {num=tonumber(obj.Name), obj=obj})
+-- ── Hold cache ────────────────────────────────
+local function buildHoldCache(nf)
+    local nn, hn = {}, {}
+    for _, o in pairs(nf:GetChildren()) do
+        if not o:IsA("GuiObject") then continue end
+        if o.Name:sub(1, 5) == "Hold_" then
+            local n = tonumber(o.Name:sub(6))
+            if n then table.insert(hn, {num = n, obj = o}) end
+        elseif tonumber(o.Name) then
+            table.insert(nn, {num = tonumber(o.Name), obj = o})
         end
     end
-    table.sort(normalNotes, function(a,b) return a.num<b.num end)
-    table.sort(holdNotes,   function(a,b) return a.num<b.num end)
-    for _, nd in pairs(normalNotes) do
-        local noteY = nd.obj.AbsolutePosition.Y
-        local closest, closestDist = nil, math.huge
-        for _, hd in pairs(holdNotes) do
-            local dist = math.abs(hd.obj.AbsolutePosition.Y - noteY)
-            if dist < closestDist then closestDist=dist;
-closest=hd.obj end
+    table.sort(nn, function(a, b) return a.num < b.num end)
+    table.sort(hn, function(a, b) return a.num < b.num end)
+    for _, nd in pairs(nn) do
+        local y = nd.obj.AbsolutePosition.Y
+        local c, cd = nil, math.huge
+        for _, hd in pairs(hn) do
+            local d = math.abs(hd.obj.AbsolutePosition.Y - y)
+            if d < cd then cd = d; c = hd.obj end
         end
-        if closest and closestDist<=50 then holdCache[nd.obj]=closest end
+        if c and cd <= 50 then holdCache[nd.obj] = c end
     end
 end
 
-local function findHoldForNote(note, notesFolder)
+local function findHold(note, nf)
     if holdCache[note] then return holdCache[note] end
-    local noteY = note.AbsolutePosition.Y
-    local closest, closestDist = nil, math.huge
-    for _, obj in pairs(notesFolder:GetChildren()) do
-        if obj.Name:sub(1,5)=="Hold_" and obj.Visible then
-            local dist = math.abs(obj.AbsolutePosition.Y - noteY)
-             if dist<closestDist then closestDist=dist; closest=obj end
+    local y = note.AbsolutePosition.Y
+    local c, cd = nil, math.huge
+    for _, o in pairs(nf:GetChildren()) do
+        if o.Name:sub(1, 5) == "Hold_" and o.Visible then
+            local d = math.abs(o.AbsolutePosition.Y - y)
+            if d < cd then cd = d; c = o end
         end
     end
-    if closest and closestDist<=50 then return closest end
-    return nil
+    return (c and cd <= 50) and c or nil
 end
 
+-- ── Rating picker ─────────────────────────────
 local function pickRating()
     local pool = {}
-    for _=1,perfectChance do table.insert(pool,"perfect") end
-    for _=1,sickChance    do table.insert(pool,"sick")    end
-    for _=1,goodChance    do table.insert(pool,"good")    end
-    for _=1,okChance      do table.insert(pool,"ok")      end
-    for _=1,badChance     do table.insert(pool,"bad")     end
-    for _=1,missChance    do table.insert(pool,"miss")    end
-    if #pool==0 then return "perfect" end
-    return pool[math.random(1,#pool)]
+    for _ = 1, perfectChance do table.insert(pool, "perfect") end
+    for _ = 1, sickChance    do table.insert(pool, "sick")    end
+    for _ = 1, goodChance    do table.insert(pool, "good")    end
+    for _ = 1, okChance      do table.insert(pool, "ok")      end
+    for _ = 1, badChance     do table.insert(pool, "bad")     end
+    for _ = 1, missChance    do table.insert(pool, "miss")    end
+    if #pool == 0 then return "perfect" end
+    return pool[math.random(1, #pool)]
 end
 
-local function handleNote(arrowIdx, note, notesFolder, arrowFolder)
-    local key     = v4.KeyBinds[arrowIdx]
-    local holdObj = findHoldForNote(note, notesFolder)
-    local isHold  = holdObj ~= nil
-    local lnHold  = arrowFolder:FindFirstChild("LnHold")
+-- ── KPS gate for legit mode ───────────────────
+local function canPress()
+    if not legitMode then return true end
+    local now = tick()
+    -- Remove entries older than 1 second
+    local i = 1
+    while i <= #kpsLog do
+        if now - kpsLog[i] > 1 then
+            table.remove(kpsLog, i)
+        else
+            i = i + 1
+        end
+    end
+    if #kpsLog >= legitKpsLimit then return false end
+    table.insert(kpsLog, now)
+    return true
+end
 
-    if v7[arrowIdx] and not isHold then
+-- ── Note handler ──────────────────────────────
+local function handleNote(ai, note, nf, af)
+    local key    = v4.KeyBinds[ai]
+    local hold   = findHold(note, nf)
+    local isHold = hold ~= nil
+    local lnHold = af:FindFirstChild("LnHold")
+
+    if v7[ai] and not isHold then
         if missJacks then return end
         task.spawn(function()
-            releaseKey(key);
-task.wait(0.02)
-            pressKey(key); task.wait(v4.TapDuration);
-releaseKey(key)
+            releaseKey(key); task.wait(0.02)
+            pressKey(key); task.wait(v4.TapDuration); releaseKey(key)
         end)
         return
     end
-    if v7[arrowIdx] then return end
-    v7[arrowIdx] = true
+    if v7[ai] then return end
+    v7[ai] = true
 
     task.spawn(function()
-        if maxReaction > 0 then
+        -- Reaction delay (0 if Perfected is on)
+        if not perfected and maxReaction > 0 then
             local lo = math.min(minReaction, maxReaction)
             local hi = math.max(minReaction, maxReaction)
-            task.wait((lo==hi and lo or math.random(lo,hi)) / 1000)
+            task.wait((lo == hi and lo or math.random(lo, hi)) / 1000)
         end
-        if pickRating()=="miss" then v7[arrowIdx]=nil; return end
+
+        -- KPS gate
+        if not canPress() then
+            v7[ai] = nil; return
+        end
+
+        -- Rating gate
+        if pickRating() == "miss" then v7[ai] = nil; return end
+
         releaseKey(key); task.wait(); pressKey(key)
+
         if isHold then
-            v7[arrowIdx]=nil; v6[holdObj]=true
-            local released=false
+            v7[ai] = nil; v6[hold] = true
+            local released = false
             local function doRelease()
                 if not released then
-                    released=true; releaseKey(key); v6[note]=nil; v6[holdObj]=nil
+                    released = true
+                    releaseKey(key); v6[note] = nil; v6[hold] = nil
                 end
             end
             task.wait(0.05)
             local conn
-            conn = v0.Heartbeat:Connect(function()
+            conn = RunService.Heartbeat:Connect(function()
                 if not lnHold then doRelease(); conn:Disconnect(); return end
-                if lnHold.ImageTransparency>=0.9 then doRelease();
-conn:Disconnect() end
+                if lnHold.ImageTransparency >= 0.9 then doRelease(); conn:Disconnect() end
             end)
         else
-            task.wait(v4.TapDuration);
-releaseKey(key); v7[arrowIdx]=nil
+            task.wait(v4.TapDuration); releaseKey(key); v7[ai] = nil
         end
     end)
 end
 
 local function getMyKeySync()
-    local Match = v5.PlayerGui:FindFirstChild("Main")
+    local M = v5.PlayerGui:FindFirstChild("Main")
         and v5.PlayerGui.Main:FindFirstChild("MatchFrame")
-    if not (Match and Match.Visible) then return nil end
-    local playerVal = v5:FindFirstChild("File") and v5.File:FindFirstChild("CurrentPlayer")
-    if playerVal and playerVal.Value then
-        local side = (playerVal.Value.Name=="Player2") and "KeySync2" or "KeySync1"
-        return Match:FindFirstChild(side)
+    if not (M and M.Visible) then return nil end
+    local pv = v5:FindFirstChild("File") and v5.File:FindFirstChild("CurrentPlayer")
+    if pv and pv.Value then
+        return M:FindFirstChild(pv.Value.Name == "Player2" and "KeySync2" or "KeySync1")
     end
-    return nil
 end
 
 function startLoop()
     if mainLoop then mainLoop:Disconnect() end
-    mainLoop = v0.Heartbeat:Connect(function()
+    mainLoop = RunService.Heartbeat:Connect(function()
         if not v8 then return end
-        local KeySync = getMyKeySync()
-        if not (KeySync and KeySync.Visible) then return end
-        for i=1,4 do
-            local folder   = KeySync:FindFirstChild("Arrow"..i)
-            local receptor = folder and folder:FindFirstChild("Arrow")
-            local notes    = folder and folder:FindFirstChild("Notes")
-            if receptor and notes then
+        local KS = getMyKeySync()
+        if not (KS and KS.Visible) then return end
+
+        for i = 1, 4 do
+            local f = KS:FindFirstChild("Arrow"..i)
+            local r = f and f:FindFirstChild("Arrow")
+            local n = f and f:FindFirstChild("Notes")
+            if r and n then
                 if not cacheBuilt[i] then
-                    cacheBuilt[i]=true;
-buildHoldCache(notes)
-                    notes.ChildAdded:Connect(function(child)
-                        if child:IsA("GuiObject") and child.Name:sub(1,5)~="Hold_" then
+                    cacheBuilt[i] = true
+                    buildHoldCache(n)
+                    n.ChildAdded:Connect(function(c)
+                        if c:IsA("GuiObject") and c.Name:sub(1, 5) ~= "Hold_" then
                             task.wait()
-                            local noteY=child.AbsolutePosition.Y
-                            local closest,closestDist=nil,math.huge
-                            for _,obj in pairs(notes:GetChildren()) do
-                                if obj.Name:sub(1,5)=="Hold_" and obj.Visible then
-                                    local dist=math.abs(obj.AbsolutePosition.Y-noteY)
-                             if dist<closestDist then closestDist=dist; closest=obj end
+                            local y = c.AbsolutePosition.Y
+                            local cl, cd = nil, math.huge
+                            for _, o in pairs(n:GetChildren()) do
+                                if o.Name:sub(1, 5) == "Hold_" and o.Visible then
+                                    local d = math.abs(o.AbsolutePosition.Y - y)
+                                    if d < cd then cd = d; cl = o end
                                 end
                             end
-                            if closest and closestDist<=50 then holdCache[child]=closest end
+                            if cl and cd <= 50 then holdCache[c] = cl end
                         end
                     end)
                 end
-                local targetY = receptor.AbsolutePosition.Y
-                for _,note in pairs(notes:GetChildren()) do
+
+                local ty = r.AbsolutePosition.Y
+                for _, note in pairs(n:GetChildren()) do
                     if not note:IsA("GuiObject") or not note.Visible
-                        or note.Name=="Arrow" or v6[note] then continue end
-                    if note.Name:sub(1,5)=="Hold_" then continue end
-                    if math.abs(note.AbsolutePosition.Y-targetY)<=v4.HitPixels then
-                        v6[note]=true
-                        handleNote(i,note,notes,folder)
-                        note.AncestryChanged:Once(function() v6[note]=nil end)
+                        or note.Name == "Arrow" or v6[note] then continue end
+                    if note.Name:sub(1, 5) == "Hold_" then continue end
+                    if math.abs(note.AbsolutePosition.Y - ty) <= v4.HitPixels then
+                        v6[note] = true
+                        handleNote(i, note, n, f)
+                        note.AncestryChanged:Once(function() v6[note] = nil end)
                     end
                 end
             end
