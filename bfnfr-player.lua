@@ -1,4 +1,4 @@
-local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/i77lhm/Libraries/refs/heads/main/Utopia/Library.lua"))()
+local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/woops-cc/private/refs/heads/main/Library.lua"))()
 
 -- OC colors: sky blue #5BC8F5, orange/gold #F5A623, white #FFFFFF
 Library.Theme["Accent"]             = Color3.fromRGB(91, 200, 245)   -- sky blue
@@ -72,16 +72,12 @@ local Window = Library:Window({
 })
 
 -- ──────────────────────────────────────────────
--- OC toggle button (ImageButton, top-right corner)
--- Uses your oc drawing as the icon.
--- Tapping it shows/hides the main UI window.
+-- OC toggle button (Sharp Cube)
 -- ──────────────────────────────────────────────
 task.defer(function()
-    -- Find the window holder frame so we can toggle it
     local holder = Library.Holder and Library.Holder.Instance
     if not holder then return end
 
-    -- The window frame is the first large Frame child of the holder
     local windowFrame
     for _, c in ipairs(holder:GetChildren()) do
         if (c:IsA("Frame") or c:IsA("TextButton")) and c.AbsoluteSize.X > 100 then
@@ -93,71 +89,48 @@ task.defer(function()
 
     local uiVisible = true
 
-    -- Button container — sits top-right, styled to match the UI border color
+    -- Base Cube matching Section Background
     local btn = Instance.new("ImageButton")
     btn.Name          = "OCToggleBtn"
-    btn.Size          = UDim2.new(0, 54, 0, 54)
-    btn.Position      = UDim2.new(1, -70, 0, 14)
+    btn.Size          = UDim2.new(0, 45, 0, 45)
+    btn.Position      = UDim2.new(1, -60, 0, 15)
     btn.AnchorPoint   = Vector2.new(0, 0)
-    btn.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+    btn.BackgroundColor3 = Color3.fromRGB(12, 12, 16) 
     btn.BorderSizePixel  = 0
     btn.ZIndex        = 999
     btn.Parent        = holder
 
-    -- Border glow using UIStroke
+    -- Sharp Border matching UI outline
     local stroke = Instance.new("UIStroke")
-    stroke.Color     = Color3.fromRGB(91, 200, 245)   -- sky blue border
-    stroke.Thickness = 2.5
-    stroke.LineJoinMode = Enum.LineJoinMode.Round
+    stroke.Color     = Color3.fromRGB(68, 68, 68) 
+    stroke.Thickness = 2
+    stroke.LineJoinMode = Enum.LineJoinMode.Miter
     stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
     stroke.Parent    = btn
 
-    -- Rounded corners (squircle-ish)
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0.22, 0)
-    corner.Parent = btn
-
-    -- OC drawing as the icon
-    -- Using your oc art asset ID — replace with your actual uploaded image rbxassetid
+    -- OC Icon
     local icon = Instance.new("ImageLabel")
-    icon.Size             = UDim2.new(0.82, 0, 0.82, 0)
-    icon.Position         = UDim2.new(0.09, 0, 0.09, 0)
+    icon.Size             = UDim2.new(0.8, 0, 0.8, 0)
+    icon.Position         = UDim2.new(0.1, 0, 0.1, 0)
     icon.BackgroundTransparency = 1
-    icon.Image            = "rbxassetid://133412738038266" -- placeholder; swap for your oc art asset
+    icon.Image            = "rbxassetid://133412738038266" 
     icon.ScaleType        = Enum.ScaleType.Fit
     icon.ZIndex           = 1000
     icon.Parent           = btn
 
-    -- Orange top-bar accent line (matching UI header)
+    -- Top bar accent matching OC Blue
     local topbar = Instance.new("Frame")
-    topbar.Size              = UDim2.new(1, 0, 0, 3)
+    topbar.Size              = UDim2.new(1, 0, 0, 2)
     topbar.Position          = UDim2.new(0, 0, 0, 0)
     topbar.BorderSizePixel   = 0
-    topbar.BackgroundColor3  = Color3.fromRGB(245, 166, 35)  -- orange/gold
+    topbar.BackgroundColor3  = Color3.fromRGB(91, 200, 245)
     topbar.ZIndex            = 1001
     topbar.Parent            = btn
 
-    local topbarGrad = Instance.new("UIGradient")
-    topbarGrad.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.fromRGB(91, 200, 245)),
-        ColorSequenceKeypoint.new(0.5, Color3.fromRGB(245, 166, 35)),
-        ColorSequenceKeypoint.new(1, Color3.fromRGB(91, 200, 245)),
-    })
-    topbarGrad.Parent = topbar
-
-    local topCorner = Instance.new("UICorner")
-    topCorner.CornerRadius = UDim.new(0.22, 0)
-    topCorner.Parent = topbar
-
-    -- Touch / click handler
     btn.MouseButton1Click:Connect(function()
         uiVisible = not uiVisible
         windowFrame.Visible = uiVisible
-        -- Pulse the border color to give feedback
-        local pulseColor = uiVisible
-            and Color3.fromRGB(91, 200, 245)   -- blue when shown
-            or  Color3.fromRGB(245, 166, 35)   -- orange when hidden
-        stroke.Color = pulseColor
+        stroke.Color = uiVisible and Color3.fromRGB(91, 200, 245) or Color3.fromRGB(68, 68, 68)
     end)
 end)
 
@@ -209,15 +182,13 @@ apSection:Toggle({
 
 -- ──────────────────────────────────────────────
 -- Player Settings
--- NaN fix: never let Default == Min. Min=0, Default=1 avoids 0/0.
--- The value passed to callback IS the real slider value so no offset needed.
 -- ──────────────────────────────────────────────
 playerSection:Slider({
     Name     = "Min Reaction",
     Flag     = "MinReaction",
     Min      = 0,
     Max      = 150,
-    Default  = 1,       -- avoids 0/0 NaN on init
+    Default  = 0,
     Decimals = 0,
     Suffix   = "ms",
     Callback = function(val) minReaction = math.floor(tonumber(val) or 0) end,
@@ -228,7 +199,7 @@ playerSection:Slider({
     Flag     = "MaxReaction",
     Min      = 0,
     Max      = 150,
-    Default  = 1,
+    Default  = 0,
     Decimals = 0,
     Suffix   = "ms",
     Callback = function(val) maxReaction = math.floor(tonumber(val) or 0) end,
@@ -280,19 +251,23 @@ miscSection:Button({
         local Speaker    = Players.LocalPlayer
         local function Alert()
             local Sound = Instance.new("Sound", game:GetService("SoundService"))
-            Sound.Volume = 2; Sound.SoundId = "rbxassetid://4590662766"
-            Sound.PlayOnRemove = true; Sound:Destroy()
+            Sound.Volume = 2;
+            Sound.SoundId = "rbxassetid://4590662766"
+            Sound.PlayOnRemove = true;
+            Sound:Destroy()
         end
         if _G.FNFRemixACPD or (getgenv and getgenv().FNFRemixACPD) then
             StarterGui:SetCore("SendNotification", {Title="🧐 Changed!", Text="Display: '"..Content.."'", Duration=5})
             Library:Notification("Content: "..Content, 4, Color3.fromRGB(91,200,245))
-            Alert(); return
+            Alert();
+            return
         end
         local Rejoin = Instance.new("BindableFunction")
         Rejoin.OnInvoke = function(Answer)
             if Answer == "Yes" and platformAutoRejoin then
                 if #Players:GetPlayers() <= 1 then
-                    Speaker:Kick("\nRejoining..."); task.wait()
+                    Speaker:Kick("\nRejoining...");
+                    task.wait()
                     TPService:Teleport(6520999642, Speaker)
                 else
                     TPService:TeleportToPlaceInstance(6520999642, game.JobId, Speaker)
@@ -327,7 +302,6 @@ miscSection:Button({
 
 -- ──────────────────────────────────────────────
 -- Hit Chances (right column)
--- Same NaN fix: Default = 1 for 0-value sliders, 100 for perfect
 -- ──────────────────────────────────────────────
 chanceSection:Slider({
     Name="Perfect Chance", Flag="PerfectChance", Min=0, Max=100, Default=100,
@@ -335,27 +309,27 @@ chanceSection:Slider({
     Callback=function(val) perfectChance = math.floor(tonumber(val) or 100) end,
 })
 chanceSection:Slider({
-    Name="Sick Chance", Flag="SickChance", Min=0, Max=100, Default=1,
+    Name="Sick Chance", Flag="SickChance", Min=0, Max=100, Default=0,
     Decimals=0, Suffix="%",
     Callback=function(val) sickChance = math.floor(tonumber(val) or 0) end,
 })
 chanceSection:Slider({
-    Name="Good Chance", Flag="GoodChance", Min=0, Max=100, Default=1,
+    Name="Good Chance", Flag="GoodChance", Min=0, Max=100, Default=0,
     Decimals=0, Suffix="%",
     Callback=function(val) goodChance = math.floor(tonumber(val) or 0) end,
 })
 chanceSection:Slider({
-    Name="Ok Chance", Flag="OkChance", Min=0, Max=100, Default=1,
+    Name="Ok Chance", Flag="OkChance", Min=0, Max=100, Default=0,
     Decimals=0, Suffix="%",
     Callback=function(val) okChance = math.floor(tonumber(val) or 0) end,
 })
 chanceSection:Slider({
-    Name="Bad Chance", Flag="BadChance", Min=0, Max=100, Default=1,
+    Name="Bad Chance", Flag="BadChance", Min=0, Max=100, Default=0,
     Decimals=0, Suffix="%",
     Callback=function(val) badChance = math.floor(tonumber(val) or 0) end,
 })
 chanceSection:Slider({
-    Name="Miss Chance", Flag="MissChance", Min=0, Max=100, Default=1,
+    Name="Miss Chance", Flag="MissChance", Min=0, Max=100, Default=0,
     Decimals=0, Suffix="%",
     Callback=function(val) missChance = math.floor(tonumber(val) or 0) end,
 })
@@ -370,7 +344,8 @@ do
     for Index, Value in Library.Theme do
         Library.ThemeColorpickers[Index] = ThemesSection:Label(Index, "Left"):Colorpicker({
             Name=Index, Flag="Theme"..Index, Default=Value,
-            Callback=function(v) Library.Theme[Index]=v; Library:ChangeTheme(Index,v) end
+            Callback=function(v) Library.Theme[Index]=v;
+Library:ChangeTheme(Index,v) end
         })
     end
     ThemesSection:Dropdown({
@@ -396,7 +371,8 @@ do
     ConfigsSection:Button({Name="Save Config", Callback=function()
         if ConfigName=="" then return end
         local p=Library.Folders.Configs.."/"..ConfigName..".json"
-        if not isfile(p) then writefile(p,Library:GetConfig()); Library:RefreshConfigsList(ConfigsListbox)
+        if not isfile(p) then writefile(p,Library:GetConfig());
+Library:RefreshConfigsList(ConfigsListbox)
         else Library:Notification("Already exists!",3,Color3.fromRGB(255,80,80)) end
     end}):SubButton({Name="Load Config", Callback=function()
         if SelectedConfig then Library:LoadConfig(readfile(Library.Folders.Configs.."/"..SelectedConfig)) end
@@ -428,7 +404,8 @@ local function buildHoldCache(notesFolder)
         local closest, closestDist = nil, math.huge
         for _, hd in pairs(holdNotes) do
             local dist = math.abs(hd.obj.AbsolutePosition.Y - noteY)
-            if dist < closestDist then closestDist=dist; closest=hd.obj end
+            if dist < closestDist then closestDist=dist;
+closest=hd.obj end
         end
         if closest and closestDist<=50 then holdCache[nd.obj]=closest end
     end
@@ -441,7 +418,7 @@ local function findHoldForNote(note, notesFolder)
     for _, obj in pairs(notesFolder:GetChildren()) do
         if obj.Name:sub(1,5)=="Hold_" and obj.Visible then
             local dist = math.abs(obj.AbsolutePosition.Y - noteY)
-            if dist<closestDist then closestDist=dist; closest=obj end
+             if dist<closestDist then closestDist=dist; closest=obj end
         end
     end
     if closest and closestDist<=50 then return closest end
@@ -469,8 +446,10 @@ local function handleNote(arrowIdx, note, notesFolder, arrowFolder)
     if v7[arrowIdx] and not isHold then
         if missJacks then return end
         task.spawn(function()
-            releaseKey(key); task.wait(0.02)
-            pressKey(key); task.wait(v4.TapDuration); releaseKey(key)
+            releaseKey(key);
+task.wait(0.02)
+            pressKey(key); task.wait(v4.TapDuration);
+releaseKey(key)
         end)
         return
     end
@@ -497,10 +476,12 @@ local function handleNote(arrowIdx, note, notesFolder, arrowFolder)
             local conn
             conn = v0.Heartbeat:Connect(function()
                 if not lnHold then doRelease(); conn:Disconnect(); return end
-                if lnHold.ImageTransparency>=0.9 then doRelease(); conn:Disconnect() end
+                if lnHold.ImageTransparency>=0.9 then doRelease();
+conn:Disconnect() end
             end)
         else
-            task.wait(v4.TapDuration); releaseKey(key); v7[arrowIdx]=nil
+            task.wait(v4.TapDuration);
+releaseKey(key); v7[arrowIdx]=nil
         end
     end)
 end
@@ -529,7 +510,8 @@ function startLoop()
             local notes    = folder and folder:FindFirstChild("Notes")
             if receptor and notes then
                 if not cacheBuilt[i] then
-                    cacheBuilt[i]=true; buildHoldCache(notes)
+                    cacheBuilt[i]=true;
+buildHoldCache(notes)
                     notes.ChildAdded:Connect(function(child)
                         if child:IsA("GuiObject") and child.Name:sub(1,5)~="Hold_" then
                             task.wait()
@@ -538,7 +520,7 @@ function startLoop()
                             for _,obj in pairs(notes:GetChildren()) do
                                 if obj.Name:sub(1,5)=="Hold_" and obj.Visible then
                                     local dist=math.abs(obj.AbsolutePosition.Y-noteY)
-                                    if dist<closestDist then closestDist=dist; closest=obj end
+                             if dist<closestDist then closestDist=dist; closest=obj end
                                 end
                             end
                             if closest and closestDist<=50 then holdCache[child]=closest end
