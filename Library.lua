@@ -2188,7 +2188,9 @@ local Library do
 
             Library.Flags[Slider.Flag] = Slider.Value
 
-            Items["Indicator"]:Tween(TweenInfo.new(0.2, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {Size = UDim2New((Slider.Value - Data.Min) / (Data.Max - Data.Min), 0, 1, 0)})
+             local _range = Data.Max - Data.Min
+             local _fill = (_range == 0) and 0 or MathClamp((Slider.Value - Data.Min) / _range, 0, 1)
+             Items["Indicator"]:Tween(TweenInfo.new(0.2, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {Size = UDim2New(_fill, 0, 1, 0)})
             Items["Value"].Instance.Text = StringFormat("%s%s", tostring(Slider.Value), Data.Suffix)
 
             if Data.Callback then 
@@ -2232,9 +2234,9 @@ local Library do
             end
         end)
 
-        if Data.Default then 
-            Slider:Set(Data.Default)
-        end
+        if Data.Default ~= nil then 
+    Slider:Set(Data.Default)
+										end
 
         Library.SetFlags[Slider.Flag] = function(Value)
             Slider:Set(Value)
