@@ -7,9 +7,17 @@ local C_WHITE  = Color3.fromRGB(220, 220, 225)
 local C_BG     = Color3.fromRGB(18,  18,  22)
 
 -- ── Window ────────────────────────────────────
+-- FIX (icon): pass the numeric ID as a plain string — the library prepends
+-- "rbxassetid://" itself. Using the full "rbxassetid://..." form with a Decal
+-- asset (not an ImageLabel asset) causes a silent empty-image result.
+-- FIX (background): Image / ImageEnabled / ImageTransparency / ImageColor are
+-- built-in window options. ImageTransparency default is 0.85 (very washed),
+-- so we lower it to 0.35 for a visible but non-distracting background.
+-- The decal was uploaded wider than the original art; ImageColor = white keeps
+-- it unaffected by theme tinting.
 local window = lib:Window("w0opsie_ap", {
     Title    = "<font color='#5BC8F5'>w0</font><font color='#F5A623'>o</font><font color='#5BC8F5'>opsie's ap</font>",
-    Icon     = "rbxassetid://71140941882804",
+    Icon     = "71140941882804",        -- plain ID, library adds rbxassetid://
     Footer   = "<font color='#5BC8F5'>Basically FNF: Remix</font>",
     Keybind  = Enum.KeyCode.RightShift,
     NeonType      = "Top",
@@ -17,6 +25,11 @@ local window = lib:Window("w0opsie_ap", {
     AnimationSpeed     = 1.2,
     ShadowTransparency = 0.4,
     ShadowSize         = 20,
+    -- background image
+    Image             = "113037548508433",   -- your OC decal ID
+    ImageEnabled      = true,
+    ImageTransparency = 0.35,               -- 0 = fully opaque, 1 = invisible
+    ImageColor        = Color3.new(1, 1, 1), -- white = no tint
     Theme = {
         Back   = C_BG,
         Main   = C_BLUE,
@@ -85,17 +98,28 @@ local function releaseKey(key)
     end
 end
 
+-- FIX (FireSignal): Instance.new("InputObject") is blocked in executor
+-- sandboxes on newer Roblox — that's what caused the 31 errors in the console.
+-- Instead we fire connections directly using a plain table that mimics the
+-- shape of an InputObject. The game's InputBegan/InputEnded handlers only read
+-- .KeyCode, .UserInputType, and .UserInputState — they don't typecheck the
+-- instance itself — so a table works fine.
+local function makeInputObj(key, state)
+    return {
+        KeyCode        = key,
+        UserInputType  = Enum.UserInputType.Keyboard,
+        UserInputState = state,
+    }
+end
+
 local function fireSignalPress(key)
     if heldKeys[key] then return end
     heldKeys[key] = true
-    local inputObj = Instance.new("InputObject")
-    inputObj.KeyCode        = key
-    inputObj.UserInputType  = Enum.UserInputType.Keyboard
-    inputObj.UserInputState = Enum.UserInputState.Begin
+    local obj = makeInputObj(key, Enum.UserInputState.Begin)
     pcall(function()
         if getconnections then
             for _, conn in ipairs(getconnections(UIS.InputBegan)) do
-                if conn.Function then pcall(conn.Function, inputObj, false) end
+                if conn.Function then pcall(conn.Function, obj, false) end
             end
         end
     end)
@@ -104,14 +128,11 @@ end
 local function fireSignalRelease(key)
     if not heldKeys[key] then return end
     heldKeys[key] = nil
-    local inputObj = Instance.new("InputObject")
-    inputObj.KeyCode        = key
-    inputObj.UserInputType  = Enum.UserInputType.Keyboard
-    inputObj.UserInputState = Enum.UserInputState.End
+    local obj = makeInputObj(key, Enum.UserInputState.End)
     pcall(function()
         if getconnections then
             for _, conn in ipairs(getconnections(UIS.InputEnded)) do
-                if conn.Function then pcall(conn.Function, inputObj, false) end
+                if conn.Function then pcall(conn.Function, obj, false) end
             end
         end
     end)
@@ -254,12 +275,7 @@ local function getMyKeySync()
     end
 end
 
--- ── FIX 1: startLoop defined HERE, before any UI/AddToggle calls ──────────
--- Old code had `local startLoop` (nil) on line 146, then assigned it on
--- line 598 after all the AddToggle calls. The library's spawn() path can
--- schedule the callback before Luau finishes the upvalue assignment, so
--- startLoop() was nil when the toggle fired. Defining it as a real
--- local function here guarantees it exists before any callback can call it.
+-- ── startLoop defined before UI so callbacks can safely call it ───────────
 local function startLoop()
     if mainLoop then mainLoop:Disconnect(); mainLoop = nil end
     mainLoop = RunService.Heartbeat:Connect(function()
@@ -567,11 +583,6 @@ miscGroup:AddButton("ApplyPlatform", {
 })
 
 -- ── Settings tab ──────────────────────────────
--- FIX 2: AddColorPicker is NOT a standalone groupbox method — it must be
--- chained onto an element the groupbox owns (Label, Toggle, Button, etc.).
--- Old code called themeGroup:AddColorPicker(...) directly → crashed with
--- "No properties, methods or options called 'AddColorPicker'".
--- Fix: AddLabel(...) returns the label object; chain :AddColorPicker() on that.
 themeGroup:AddLabel("ThemeLbl1", {
     Text = "<font color='#5BC8F5'><b>Accent</b></font> (default: sky blue #5BC8F5)"
 }):AddColorPicker("ThemeMain", {
