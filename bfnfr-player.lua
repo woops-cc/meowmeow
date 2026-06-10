@@ -7,17 +7,9 @@ local C_WHITE  = Color3.fromRGB(220, 220, 225)
 local C_BG     = Color3.fromRGB(18,  18,  22)
 
 -- ── Window ────────────────────────────────────
--- FIX (icon): pass the numeric ID as a plain string — the library prepends
--- "rbxassetid://" itself. Using the full "rbxassetid://..." form with a Decal
--- asset (not an ImageLabel asset) causes a silent empty-image result.
--- FIX (background): Image / ImageEnabled / ImageTransparency / ImageColor are
--- built-in window options. ImageTransparency default is 0.85 (very washed),
--- so we lower it to 0.35 for a visible but non-distracting background.
--- The decal was uploaded wider than the original art; ImageColor = white keeps
--- it unaffected by theme tinting.
 local window = lib:Window("w0opsie_ap", {
     Title    = "<font color='#5BC8F5'>w0</font><font color='#F5A623'>o</font><font color='#5BC8F5'>opsie's ap</font>",
-    Icon     = "71140941882804",        -- plain ID, library adds rbxassetid://
+    Icon     = "71140941882804",
     Footer   = "<font color='#5BC8F5'>Basically FNF: Remix</font>",
     Keybind  = Enum.KeyCode.RightShift,
     NeonType      = "Top",
@@ -25,11 +17,10 @@ local window = lib:Window("w0opsie_ap", {
     AnimationSpeed     = 1.2,
     ShadowTransparency = 0.4,
     ShadowSize         = 20,
-    -- background image
-    Image             = "113037548508433",   -- your OC decal ID
+    Image             = "113037548508433",
     ImageEnabled      = true,
-    ImageTransparency = 0.35,               -- 0 = fully opaque, 1 = invisible
-    ImageColor        = Color3.new(1, 1, 1), -- white = no tint
+    ImageTransparency = 0.35,
+    ImageColor        = Color3.new(1, 1, 1),
     Theme = {
         Back   = C_BG,
         Main   = C_BLUE,
@@ -37,6 +28,39 @@ local window = lib:Window("w0opsie_ap", {
         Text   = C_WHITE,
     },
 })
+
+-- FIX (Icon + Background): newer Roblox requires ImageContent = Content.fromUri()
+-- The library only sets .Image which is now deprecated and may not render.
+-- We patch both the RealWindow background and the mobile button icon directly
+-- after the window is created.
+task.defer(function()
+    -- background
+    local rw = window.RealWindow
+    if rw then
+        local uri = "rbxassetid://113037548508433"
+        pcall(function() rw.ImageContent = Content.fromUri(uri) end)
+        pcall(function() rw.Image = uri end)  -- fallback for older clients
+    end
+    -- topbar icon
+    local icon = window.RealWindow
+        and window.RealWindow.Parent
+        and window.RealWindow.Parent.Parent
+    -- walk up to find the TitleZone Icon ImageLabel
+    local function findIcon(inst)
+        if not inst then return end
+        for _, v in ipairs(inst:GetDescendants()) do
+            if v:IsA("ImageLabel") and v.Name == "Icon" then
+                local uri2 = "rbxassetid://71140941882804"
+                pcall(function() v.ImageContent = Content.fromUri(uri2) end)
+                pcall(function() v.Image = uri2 end)
+            end
+        end
+    end
+    -- find the GUI root
+    local gui = game:GetService("CoreGui"):FindFirstChild("w0opsie_ap")
+        or game:GetService("Players").LocalPlayer.PlayerGui:FindFirstChild("w0opsie_ap")
+    if gui then findIcon(gui) end
+end)
 
 -- ── Services ──────────────────────────────────
 local RunService = game:GetService("RunService")
@@ -98,44 +122,64 @@ local function releaseKey(key)
     end
 end
 
--- FIX (FireSignal): Instance.new("InputObject") is blocked in executor
--- sandboxes on newer Roblox — that's what caused the 31 errors in the console.
--- Instead we fire connections directly using a plain table that mimics the
--- shape of an InputObject. The game's InputBegan/InputEnded handlers only read
--- .KeyCode, .UserInputType, and .UserInputState — they don't typecheck the
--- instance itself — so a table works fine.
-local function makeInputObj(key, state)
-    return {
-        KeyCode        = key,
-        UserInputType  = Enum.UserInputType.Keyboard,
-        UserInputState = state,
-    }
-end
+-- FIX (FireSignal): the game's input handlers call :IsA() on the input object,
+-- so a plain table silently fails. Use the executor's native keypress/keyrelease
+-- if available (works on Synapse, Fluxus, Delta, etc.), fall back to VIM.
+local nativePress   = (keypress   and keypress)   or nil
+local nativeRelease = (keyrelease and keyrelease)  or nil
 
 local function fireSignalPress(key)
     if heldKeys[key] then return end
     heldKeys[key] = true
-    local obj = makeInputObj(key, Enum.UserInputState.Begin)
-    pcall(function()
-        if getconnections then
-            for _, conn in ipairs(getconnections(UIS.InputBegan)) do
-                if conn.Function then pcall(conn.Function, obj, false) end
+    if nativePress then
+        pcall(nativePress, key.Value)
+    else
+        -- last-resort: fire UIS connections with a metatable-wrapped table
+        -- that passes :IsA("InputObject") checks
+        local mt = {}
+        mt.__index = mt
+        mt.IsA = function(_, cls) return cls == "InputObject" or cls == "Instance" end
+        mt.GetAttribute = function() return nil end
+        mt.KeyCode        = key
+        mt.UserInputType  = Enum.UserInputType.Keyboard
+        mt.UserInputState = Enum.UserInputState.Begin
+        mt.Delta          = Vector3.new()
+        mt.Position       = Vector3.new()
+        setmetatable(mt, mt)
+        pcall(function()
+            if getconnections then
+                for _, conn in ipairs(getconnections(UIS.InputBegan)) do
+                    if conn.Function then pcall(conn.Function, mt, false) end
+                end
             end
-        end
-    end)
+        end)
+    end
 end
 
 local function fireSignalRelease(key)
     if not heldKeys[key] then return end
     heldKeys[key] = nil
-    local obj = makeInputObj(key, Enum.UserInputState.End)
-    pcall(function()
-        if getconnections then
-            for _, conn in ipairs(getconnections(UIS.InputEnded)) do
-                if conn.Function then pcall(conn.Function, obj, false) end
+    if nativeRelease then
+        pcall(nativeRelease, key.Value)
+    else
+        local mt = {}
+        mt.__index = mt
+        mt.IsA = function(_, cls) return cls == "InputObject" or cls == "Instance" end
+        mt.GetAttribute = function() return nil end
+        mt.KeyCode        = key
+        mt.UserInputType  = Enum.UserInputType.Keyboard
+        mt.UserInputState = Enum.UserInputState.End
+        mt.Delta          = Vector3.new()
+        mt.Position       = Vector3.new()
+        setmetatable(mt, mt)
+        pcall(function()
+            if getconnections then
+                for _, conn in ipairs(getconnections(UIS.InputEnded)) do
+                    if conn.Function then pcall(conn.Function, mt, false) end
+                end
             end
-        end
-    end)
+        end)
+    end
 end
 
 local function doPress(key)
@@ -214,7 +258,13 @@ local function canPress()
 end
 
 -- ── Note handler ──────────────────────────────
-local function handleNote(ai, note, nf, af)
+-- FIX (Perfected timing): the old code used task.spawn + task.wait() even in
+-- the perfected path, adding 1-2 frame delays (~16ms each). When perfected,
+-- we press synchronously in the same RenderStepped callback that detected the
+-- note — zero scheduled yields, zero frame budget lost.
+-- For non-perfected / legit paths we still use task.spawn so the delays don't
+-- block the detection loop.
+local function handleNote(ai, note, nf, af, sync)
     local key    = v4.KeyBinds[ai]
     local hold   = findHold(note, nf)
     local isHold = hold ~= nil
@@ -222,29 +272,22 @@ local function handleNote(ai, note, nf, af)
 
     if v7[ai] and not isHold then
         if missJacks then return end
-        task.spawn(function()
-            doRelease(key); task.wait(0.02)
-            doPress(key); task.wait(v4.TapDuration); doRelease(key)
-        end)
+        if not sync then
+            task.spawn(function()
+                doRelease(key); task.wait(0.02)
+                doPress(key); task.wait(v4.TapDuration); doRelease(key)
+            end)
+        end
         return
     end
     if v7[ai] then return end
     v7[ai] = true
 
-    task.spawn(function()
-        local rating = pickRating()
-        if not perfected then
-            if maxReaction > 0 then
-                local lo = math.min(minReaction, maxReaction)
-                local hi = math.max(minReaction, maxReaction)
-                task.wait((lo == hi and lo or math.random(lo,hi)) / 1000)
-            end
-            local extra = ratingDelay(rating)
-            if extra > 0 then task.wait(extra) end
-        end
+    local function pressPath()
         if not canPress() then v7[ai]=nil; return end
-        if rating == "miss" then v7[ai]=nil; return end
-        doRelease(key); task.wait(); doPress(key)
+        doRelease(key)
+        if not sync then task.wait() end  -- only yield when not in sync/perfected mode
+        doPress(key)
         if isHold then
             v7[ai]=nil; v6[hold]=true
             local released = false
@@ -253,16 +296,41 @@ local function handleNote(ai, note, nf, af)
                     released=true; doRelease(key); v6[note]=nil; v6[hold]=nil
                 end
             end
-            task.wait(0.05)
-            local conn
-            conn = RunService.Heartbeat:Connect(function()
-                if not lnHold then doRel(); conn:Disconnect(); return end
-                if lnHold.ImageTransparency >= 0.9 then doRel(); conn:Disconnect() end
+            task.delay(0.05, function()
+                local conn
+                conn = RunService.Heartbeat:Connect(function()
+                    if not lnHold then doRel(); conn:Disconnect(); return end
+                    if lnHold.ImageTransparency >= 0.9 then doRel(); conn:Disconnect() end
+                end)
             end)
         else
-            task.wait(v4.TapDuration); doRelease(key); v7[ai]=nil
+            task.delay(v4.TapDuration, function()
+                doRelease(key); v7[ai]=nil
+            end)
         end
-    end)
+    end
+
+    if sync then
+        -- perfected: run entirely synchronous, no yields, no spawns
+        if rating == "miss" then v7[ai]=nil; return end
+        pressPath()
+    else
+        task.spawn(function()
+            local rating = pickRating()
+            if not perfected then
+                if maxReaction > 0 then
+                    local lo = math.min(minReaction, maxReaction)
+                    local hi = math.max(minReaction, maxReaction)
+                    task.wait((lo == hi and lo or math.random(lo,hi)) / 1000)
+                end
+                local extra = ratingDelay(rating)
+                if extra > 0 then task.wait(extra) end
+            end
+            if not canPress() then v7[ai]=nil; return end
+            if rating == "miss" then v7[ai]=nil; return end
+            pressPath()
+        end)
+    end
 end
 
 local function getMyKeySync()
@@ -275,10 +343,15 @@ local function getMyKeySync()
     end
 end
 
--- ── startLoop defined before UI so callbacks can safely call it ───────────
+-- ── startLoop ─────────────────────────────────
+-- FIX (Perfected timing cont.): when perfected is ON we connect to
+-- RenderStepped (fires before the frame is rendered, giving us the earliest
+-- possible moment to act). When it's OFF we use Heartbeat as before.
+-- The sync flag passed to handleNote tells it to press without any yields.
 local function startLoop()
     if mainLoop then mainLoop:Disconnect(); mainLoop = nil end
-    mainLoop = RunService.Heartbeat:Connect(function()
+
+    local function tick_fn(isPerfectedRun)
         if not v8 then return end
         local KS = getMyKeySync()
         if not (KS and KS.Visible) then return end
@@ -312,13 +385,25 @@ local function startLoop()
                     if note.Name:sub(1,5) == "Hold_" then continue end
                     if math.abs(note.AbsolutePosition.Y - ty) <= v4.HitPixels then
                         v6[note] = true
-                        handleNote(i, note, n, f)
+                        handleNote(i, note, n, f, isPerfectedRun)
                         note.AncestryChanged:Once(function() v6[note]=nil end)
                     end
                 end
             end
         end
-    end)
+    end
+
+    if perfected then
+        -- RenderStepped: fires at the very start of each frame before rendering
+        -- This is the earliest hook available — minimises detection-to-press latency
+        mainLoop = RunService.RenderStepped:Connect(function()
+            tick_fn(true)
+        end)
+    else
+        mainLoop = RunService.Heartbeat:Connect(function()
+            tick_fn(false)
+        end)
+    end
 end
 
 -- ── Tabs ──────────────────────────────────────
@@ -439,10 +524,15 @@ apGroup:AddSeparator("APSep3", {})
 apGroup:AddToggle("Perfected", {
     Text    = "Perfected",
     Value   = false,
-    Tooltip = "Forces 0ms reaction time — hits every note at the earliest possible frame",
+    Tooltip = "Forces 0ms reaction — uses RenderStepped for earliest possible frame detection",
     Callback = function(val)
         perfected = val
         if val then minReaction = 0; maxReaction = 0 end
+        -- restart loop on the correct signal for the new mode
+        if v8 then
+            if mainLoop then mainLoop:Disconnect(); mainLoop = nil end
+            startLoop()
+        end
         window:Notification({
             Title = "Perfected",
             Text  = val and "<font color='#5BC8F5'>ON</font> — hitting at <b>0ms</b>" or "<font color='#F5A623'>OFF</font>",
