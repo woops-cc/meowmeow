@@ -6,47 +6,63 @@ local C_ORANGE = Color3.fromRGB(245, 166, 35)
 local C_WHITE  = Color3.fromRGB(220, 220, 225)
 local C_BG     = Color3.fromRGB(18,  18,  22)
 
--- ── Window ────────────────────────────────────
-local window = lib:Window("w0opsie_ap", {
-    Title    = "<font color='#5BC8F5'>w0</font><font color='#F5A623'>o</font><font color='#5BC8F5'>opsie's ap</font>",
-    Icon     = "71140941882804",
-    Footer   = "<font color='#5BC8F5'>Basically FNF: Remix</font>",
-    Keybind  = Enum.KeyCode.RightShift,
-    NeonType      = "Top",
-    NeonThickness = 2,
-    AnimationSpeed     = 1.2,
-    ShadowTransparency = 0.4,
-    ShadowSize         = 20,
-    Image             = "113037548508433",
-    ImageEnabled      = true,
-    ImageTransparency = 0.35,
-    ImageColor        = Color3.new(1, 1, 1),
-    Theme = {
-        Back   = C_BG,
-        Main   = C_BLUE,
-        Stroke = C_ORANGE,
-        Text   = C_WHITE,
-    },
-})
+-- ── Icon + Background via getcustomasset ──────
+-- The library itself uses getcustomasset (gca) to download images as local
+-- files and serve them via rbxasset://, which is the only URL format that
+-- reliably updates both .Image and .ImageContent on newer Roblox clients.
+-- We replicate that approach: download the PNG, save to disk, use gca.
+local function downloadAsset(assetId, filename)
+    if not (getcustomasset and writefile and isfile) then return nil end
+    local path = "w0opsie_cache/" .. filename
+    if not isfile(path) then
+        local ok, data = pcall(function()
+            return game:HttpGet("https://assetdelivery.roblox.com/v1/asset/?id=" .. assetId, true)
+        end)
+        if not ok or not data or #data < 128 then return nil end
+        pcall(function() makefolder("w0opsie_cache") end)
+        writefile(path, data)
+    end
+    local ok2, asset = pcall(getcustomasset, path)
+    return ok2 and asset or nil
+end
 
--- FIX (Icon + Background): window.RealWindow is on window.Window, not proxy.
--- Also must set ImageContent for newer Roblox clients.
-task.defer(function()
-    local ok, rw = pcall(function() return window.Window.RealWindow end)
-    if ok and rw then
-        local bgUri = "rbxassetid://113037548508433"
-        pcall(function() rw.ImageContent = Content.fromUri(bgUri) end)
-        pcall(function() rw.Image = bgUri end)
+-- Apply a local asset URI to an ImageLabel, then watch for library overwrites
+local function applyAndWatch(inst, localUri, fallbackUri)
+    if not inst then return end
+    local function apply()
+        local uri = localUri or fallbackUri
+        pcall(function() inst.Image = uri end)
+        pcall(function() inst.ImageContent = Content.fromUri(uri) end)
     end
-    local ok2, icon = pcall(function()
-        return window.Window.RealWindow.Contents.TopbarZone.TitleZone.Icon
+    apply()
+    inst:GetPropertyChangedSignal("Image"):Connect(function()
+        if inst.Image ~= (localUri or fallbackUri) then apply() end
     end)
-    if ok2 and icon then
-        local iconUri = "rbxassetid://71140941882804"
-        pcall(function() icon.ImageContent = Content.fromUri(iconUri) end)
-        pcall(function() icon.Image = iconUri end)
-        icon.Visible = true
-    end
+end
+
+task.defer(function()
+    task.wait(3) -- wait for library's spawn() icon download
+
+    -- Download assets via getcustomasset if available
+    local bgUri   = downloadAsset("113037548508433", "bg.png")
+        or "rbxassetid://113037548508433"
+    local iconUri = downloadAsset("71140941882804",  "icon.png")
+        or "rbxassetid://71140941882804"
+
+    pcall(function()
+        applyAndWatch(window.Window.RealWindow, bgUri, "rbxassetid://113037548508433")
+    end)
+    pcall(function()
+        applyAndWatch(
+            window.Window.RealWindow.Contents.TopbarZone.TitleZone.Icon,
+            iconUri, "rbxassetid://71140941882804"
+        )
+    end)
+    pcall(function()
+        local btn = window.MobileButton.CanvasGroup.ImageLabel
+        applyAndWatch(btn, iconUri, "rbxassetid://71140941882804")
+        btn.Visible = true
+    end)
 end)
 
 -- ── Services ──────────────────────────────────
@@ -54,62 +70,45 @@ local RunService = game:GetService("RunService")
 local VIM        = game:GetService("VirtualInputManager")
 local Players    = game:GetService("Players")
 
--- ── Game hit windows (seconds) ────────────────
--- These are the actual offset windows BFNFR:R uses per rating.
--- "Perfect" requires the note to be pressed within the earliest detection
--- frame. We target 0ms by pressing the instant the note enters HitPixels.
--- For non-perfect ratings we add a deliberate delay after detection.
 local HIT_OFFSETS = {
-    -- perfect = 0 (no delay — press immediately on detection)
-    sick = 0.045,   -- aim for centre of Sick window (~45ms)
-    good = 0.075,   -- centre of Good window (~75ms)
-    ok   = 0.125,   -- centre of Ok window (~125ms)
-    bad  = 0.175,   -- centre of Bad window (~175ms)
+    sick = 0.045, good = 0.075, ok = 0.125, bad = 0.175,
 }
 
--- ── Config ────────────────────────────────────
 local v4 = {
     KeyBinds    = {Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.W, Enum.KeyCode.D},
-    -- HitPixels: how close (in screen px) a note must be to the receptor
-    -- before we fire the key. Smaller = press closer to centre of window.
-    -- The game's hit window is evaluated server-side based on when VIM
-    -- delivers the event, so we want to press as EARLY as possible.
-    -- 20px gives a small lead so the event arrives before the centre.
     HitPixels   = 20,
     TapDuration = 0.05,
 }
 
-local v5         = Players.LocalPlayer
-local v6         = {}   -- notes currently being processed
-local v7         = {}   -- lanes currently held (jack detection)
-local v8         = false
+local v5 = Players.LocalPlayer
+local v6 = {}
+local v8 = false
 local missJacks  = false
 local legitMode  = false
 local perfected  = false
 local mainLoop   = nil
-local holdCache  = {}
-local cacheBuilt = {}
 local heldKeys   = {}
 local kpsLog     = {}
+
+local laneHeld    = {false,false,false,false}
+local laneHolding = {false,false,false,false}
+-- pendingHold[i]: a Hold_ frame that is close enough to the receptor
+-- (set by proximity check, not by ChildAdded)
+local pendingHold = {nil,nil,nil,nil}
 
 local minReaction   = 0
 local maxReaction   = 0
 local legitKpsLimit = 100
-
--- Hit chance weights (integer weights, not percentages)
--- pickRating() builds a pool from these and picks randomly.
--- perfectChance=100, all others=0 → always Perfect.
 local perfectChance = 100
 local sickChance    = 0
 local goodChance    = 0
 local okChance      = 0
 local badChance     = 0
 local missChance    = 0
-
 local platformContent    = "😇"
 local platformAutoRejoin = true
 
--- ── Input (VIM only — confirmed working for this game) ────────────────────
+-- ── Input ─────────────────────────────────────
 local function doPress(key)
     if not heldKeys[key] then
         heldKeys[key] = true
@@ -123,48 +122,6 @@ local function doRelease(key)
     end
 end
 
--- ── Hold cache ────────────────────────────────
-local function buildHoldCache(nf)
-    local nn, hn = {}, {}
-    for _, o in pairs(nf:GetChildren()) do
-        if not o:IsA("GuiObject") then continue end
-        if o.Name:sub(1,5) == "Hold_" then
-            local n = tonumber(o.Name:sub(6))
-            if n then table.insert(hn, {num=n, obj=o}) end
-        elseif tonumber(o.Name) then
-            table.insert(nn, {num=tonumber(o.Name), obj=o})
-        end
-    end
-    table.sort(nn, function(a,b) return a.num < b.num end)
-    table.sort(hn, function(a,b) return a.num < b.num end)
-    for _, nd in pairs(nn) do
-        local y = nd.obj.AbsolutePosition.Y
-        local c, cd = nil, math.huge
-        for _, hd in pairs(hn) do
-            local d = math.abs(hd.obj.AbsolutePosition.Y - y)
-            if d < cd then cd=d; c=hd.obj end
-        end
-        if c and cd <= 50 then holdCache[nd.obj] = c end
-    end
-end
-
-local function findHold(note, nf)
-    if holdCache[note] then return holdCache[note] end
-    local y = note.AbsolutePosition.Y
-    local c, cd = nil, math.huge
-    for _, o in pairs(nf:GetChildren()) do
-        if o.Name:sub(1,5) == "Hold_" and o.Visible then
-            local d = math.abs(o.AbsolutePosition.Y - y)
-            if d < cd then cd=d; c=o end
-        end
-    end
-    return (c and cd <= 50) and c or nil
-end
-
--- ── Rating pool ───────────────────────────────
--- Builds a weighted random pool. Each variable contributes that many
--- entries. e.g. perfectChance=3, sickChance=1 → 75% Perfect, 25% Sick.
--- All zero → defaults to Perfect.
 local function pickRating()
     local pool = {}
     for _=1,perfectChance do table.insert(pool,"perfect") end
@@ -189,20 +146,40 @@ local function canPress()
     return true
 end
 
--- ── Note handler ──────────────────────────────
--- PERFECTED path: called synchronously from RenderStepped.
--- No yields, no spawns — press fires in the same callback frame
--- that detected the note, giving minimum possible latency.
---
--- NON-PERFECTED path: spawned, adds reaction delay + rating offset.
-local function handleNote(ai, note, nf, af, sync)
-    local key    = v4.KeyBinds[ai]
-    local hold   = findHold(note, nf)
-    local isHold = hold ~= nil
-    local lnHold = af:FindFirstChild("LnHold")
+-- ── Hold release watcher ──────────────────────
+-- Called after the key has been pressed for a hold.
+-- Releases when the Hold_ Frame leaves the game tree.
+local function watchHoldRelease(ai, holdFrame)
+    local key = v4.KeyBinds[ai]
+    local released = false
+    local function release()
+        if released then return end
+        released = true
+        laneHolding[ai] = false
+        doRelease(key)
+    end
+    holdFrame.AncestryChanged:Connect(function()
+        if not holdFrame:IsDescendantOf(game) then release() end
+    end)
+    local conn
+    conn = RunService.Heartbeat:Connect(function()
+        if released then conn:Disconnect(); return end
+        if not holdFrame:IsDescendantOf(game) then
+            release(); conn:Disconnect()
+        end
+    end)
+end
 
-    -- Jack handling: same lane pressed again before release
-    if v7[ai] and not isHold then
+-- ── Note handler ──────────────────────────────
+local function handleNote(ai, note, sync)
+    local key = v4.KeyBinds[ai]
+    if laneHolding[ai] then return end
+
+    local holdFrame = pendingHold[ai]
+    local isHold    = holdFrame ~= nil
+    if isHold then pendingHold[ai] = nil end
+
+    if not isHold and laneHeld[ai] then
         if missJacks then return end
         if not sync then
             task.spawn(function()
@@ -212,60 +189,56 @@ local function handleNote(ai, note, nf, af, sync)
         end
         return
     end
-    if v7[ai] then return end
-    v7[ai] = true
 
-    -- Shared press + hold logic
     local function pressPath()
-        if not canPress() then v7[ai]=nil; return end
-        doRelease(key)
-        -- In perfected/sync mode we skip even the task.wait() between
-        -- release and press — every microsecond counts for the hit window.
-        if not sync then task.wait() end
-        doPress(key)
+        if not canPress() then
+            if not isHold then laneHeld[ai] = false end
+            return
+        end
         if isHold then
-            v7[ai]=nil; v6[hold]=true
-            local released = false
-            local function doRel()
-                if not released then
-                    released=true; doRelease(key); v6[note]=nil; v6[hold]=nil
-                end
-            end
-            task.delay(0.05, function()
-                local conn
-                conn = RunService.Heartbeat:Connect(function()
-                    if not lnHold then doRel(); conn:Disconnect(); return end
-                    if lnHold.ImageTransparency >= 0.9 then doRel(); conn:Disconnect() end
-                end)
-            end)
+            laneHolding[ai] = true
+            doRelease(key)
+            if not sync then task.wait() end
+            doPress(key)
+            watchHoldRelease(ai, holdFrame)
         else
+            laneHeld[ai] = true
+            doRelease(key)
+            if not sync then task.wait() end
+            doPress(key)
             task.delay(v4.TapDuration, function()
-                doRelease(key); v7[ai]=nil
+                doRelease(key); laneHeld[ai] = false
             end)
         end
     end
 
     if sync then
-        -- Perfected: synchronous, no yields at all
+        local rating = pickRating()
+        if rating == "miss" then
+            if not isHold then laneHeld[ai] = false end
+            return
+        end
         pressPath()
     else
         task.spawn(function()
             local rating = pickRating()
-            -- Reaction delay (human simulation, only when not perfected)
             if maxReaction > 0 then
                 local lo = math.min(minReaction, maxReaction)
                 local hi = math.max(minReaction, maxReaction)
                 task.wait((lo == hi and lo or math.random(lo,hi)) / 1000)
             end
-            -- Rating-based offset delay
-            -- "perfect" = 0 extra delay (press immediately)
-            -- other ratings = wait until centre of their hit window
             if rating ~= "perfect" then
-                local offset = HIT_OFFSETS[rating]
-                if offset then task.wait(offset) end
+                local off = HIT_OFFSETS[rating]
+                if off then task.wait(off) end
             end
-            if not canPress() then v7[ai]=nil; return end
-            if rating == "miss"    then v7[ai]=nil; return end
+            if not canPress() then
+                if not isHold then laneHeld[ai] = false end
+                return
+            end
+            if rating == "miss" then
+                if not isHold then laneHeld[ai] = false end
+                return
+            end
             pressPath()
         end)
     end
@@ -282,65 +255,80 @@ local function getMyKeySync()
 end
 
 -- ── Main loop ─────────────────────────────────
--- PERFECTED: uses RenderStepped (fires before the frame renders — earliest
--- possible hook). Passes sync=true to handleNote so no yields occur.
---
--- NORMAL: uses Heartbeat with sync=false (task.spawn + delays allowed).
---
--- Restarted whenever Perfected is toggled while the AP is running.
+-- Both regular notes AND Hold_ frames are detected by PROXIMITY to the
+-- receptor. Hold_ frames are Frames (no ImageTransparency) — we only
+-- set pendingHold when the frame is within HitPixels of the receptor,
+-- NOT when it first appears (which was causing early holds).
 local function startLoop()
     if mainLoop then mainLoop:Disconnect(); mainLoop = nil end
+
+    local seenNotes = {}   -- dedup for regular notes already processed
+    local seenHolds = {}   -- dedup for Hold_ frames already registered
+
+    local cacheBuilt = {}
 
     local function tick_fn(sync)
         if not v8 then return end
         local KS = getMyKeySync()
         if not (KS and KS.Visible) then return end
+
         for i = 1, 4 do
             local f = KS:FindFirstChild("Arrow"..i)
             local r = f and f:FindFirstChild("Arrow")
             local n = f and f:FindFirstChild("Notes")
-            if r and n then
-                if not cacheBuilt[i] then
-                    cacheBuilt[i] = true
-                    buildHoldCache(n)
-                    n.ChildAdded:Connect(function(c)
-                        if c:IsA("GuiObject") and c.Name:sub(1,5) ~= "Hold_" then
-                            task.wait()
-                            local y = c.AbsolutePosition.Y
-                            local cl, cd = nil, math.huge
-                            for _, o in pairs(n:GetChildren()) do
-                                if o.Name:sub(1,5) == "Hold_" and o.Visible then
-                                    local d = math.abs(o.AbsolutePosition.Y - y)
-                                    if d < cd then cd=d; cl=o end
-                                end
+            if not (r and n) then continue end
+
+            -- Register ChildAdded once to keep seenHolds clean on removal
+            if not cacheBuilt[i] then
+                cacheBuilt[i] = true
+                n.ChildAdded:Connect(function(c)
+                    -- When a Hold_ frame is REMOVED, clear its seen entry
+                    if c.Name:sub(1,5) == "Hold_" then
+                        c.AncestryChanged:Connect(function()
+                            if not c:IsDescendantOf(game) then
+                                seenHolds[c] = nil
+                                if pendingHold[i] == c then pendingHold[i] = nil end
                             end
-                            if cl and cd <= 50 then holdCache[c] = cl end
-                        end
-                    end)
-                end
-                local ty = r.AbsolutePosition.Y
-                for _, note in pairs(n:GetChildren()) do
-                    if not note:IsA("GuiObject") or not note.Visible
-                        or note.Name == "Arrow" or v6[note] then continue end
-                    if note.Name:sub(1,5) == "Hold_" then continue end
-                    if math.abs(note.AbsolutePosition.Y - ty) <= v4.HitPixels then
-                        v6[note] = true
-                        handleNote(i, note, n, f, sync)
-                        note.AncestryChanged:Once(function() v6[note]=nil end)
+                        end)
                     end
+                end)
+            end
+
+            if laneHolding[i] then continue end
+
+            local ty = r.AbsolutePosition.Y
+
+            for _, child in pairs(n:GetChildren()) do
+                if not child:IsA("GuiObject") then continue end
+                if not child.Visible then continue end
+                if child.Name == "Arrow" then continue end
+
+                local dist = math.abs(child.AbsolutePosition.Y - ty)
+                if dist > v4.HitPixels then continue end
+
+                if child.Name:sub(1,5) == "Hold_" then
+                    -- Hold frame is at receptor — register as pending if not seen
+                    if not seenHolds[child] then
+                        seenHolds[child] = true
+                        pendingHold[i] = child
+                    end
+                else
+                    -- Regular note at receptor
+                    if seenNotes[child] then continue end
+                    seenNotes[child] = true
+                    handleNote(i, child, sync)
+                    child.AncestryChanged:Once(function()
+                        seenNotes[child] = nil
+                    end)
                 end
             end
         end
     end
 
     if perfected then
-        mainLoop = RunService.RenderStepped:Connect(function()
-            tick_fn(true)
-        end)
+        mainLoop = RunService.RenderStepped:Connect(function() tick_fn(true) end)
     else
-        mainLoop = RunService.Heartbeat:Connect(function()
-            tick_fn(false)
-        end)
+        mainLoop = RunService.Heartbeat:Connect(function() tick_fn(false) end)
     end
 end
 
@@ -359,7 +347,7 @@ infoLeft:AddLabel("InfoL1", {
 })
 infoLeft:AddSeparator("InfoSep1", {})
 infoLeft:AddLabel("InfoL2", {
-    Text = "<font color='#F5A623'><b>📌 Best settings for all perfects:</b></font>\n• Scroll speed: <b>2.0</b>\n• Perfected: <b>ON</b>\n• Min/Max Reaction: <b>0ms</b>\n• Perfect Chance: <b>100</b>, all others <b>0</b>"
+    Text = "<font color='#F5A623'><b>📌 Best settings for all Perfects:</b></font>\n• Scroll speed: <b>2.0</b>\n• Perfected: <b>ON</b>\n• Min/Max Reaction: <b>0ms</b>\n• Perfect weight: <b>100</b>, rest <b>0</b>"
 })
 infoLeft:AddSeparator("InfoSep2", {})
 infoLeft:AddLabel("InfoL3", {
@@ -369,12 +357,12 @@ infoLeft:AddLabel("InfoL3", {
 infoRight:AddLabel("InfoR1", { Text = "<font color='#F5A623'><b>🎮 Feature Guide</b></font>" })
 infoRight:AddSeparator("InfoSepR1", {})
 infoRight:AddLabel("InfoR2", { Text = "<font color='#5BC8F5'><b>Enable</b></font>\nTurns the auto player on/off." })
-infoRight:AddLabel("InfoR3", { Text = "<font color='#5BC8F5'><b>Input</b></font>\nUses Roblox VirtualInputManager — the only method that works for this game." })
-infoRight:AddLabel("InfoR4", { Text = "<font color='#5BC8F5'><b>Miss Jack Notes</b></font>\nSkips rapid same-key notes to look more human." })
-infoRight:AddLabel("InfoR5", { Text = "<font color='#5BC8F5'><b>Legit Mode</b></font>\nCaps KPS and biases ratings toward Sick/Good. Set KPS Limit to control max keys per second." })
-infoRight:AddLabel("InfoR6", { Text = "<font color='#5BC8F5'><b>Perfected</b></font>\nUses RenderStepped (earliest frame hook) + synchronous press with no yields. This is the tightest possible press timing achievable from a LocalScript." })
+infoRight:AddLabel("InfoR3", { Text = "<font color='#5BC8F5'><b>Input</b></font>\nUses VirtualInputManager — confirmed working method." })
+infoRight:AddLabel("InfoR4", { Text = "<font color='#5BC8F5'><b>Miss Jack Notes</b></font>\nSkips rapid same-key notes." })
+infoRight:AddLabel("InfoR5", { Text = "<font color='#5BC8F5'><b>Legit Mode</b></font>\nCaps KPS and biases ratings toward Sick/Good." })
+infoRight:AddLabel("InfoR6", { Text = "<font color='#5BC8F5'><b>Perfected</b></font>\nRenderStepped + sync press. Tightest timing possible." })
 infoRight:AddLabel("InfoR7", {
-    Text = "<font color='#5BC8F5'><b>Hit Chances</b></font>\nEach slider is a <b>weight</b>, not a percentage. The script builds a pool with that many entries per rating and picks randomly.\n\nExample: Perfect=3, Sick=1 → 75% Perfect, 25% Sick.\nAll zero → always Perfect.\n\n<font color='#F5A623'><b>Game hit windows:</b></font>\n⬜ Perfect: earliest press\n🟣 Sick: ~45ms after\n🟢 Good: ~75ms after\n🟡 Ok: ~125ms after\n🔴 Bad: ~175ms after"
+    Text = "<font color='#5BC8F5'><b>Hit Chances</b></font>\nWeights not percentages.\nAll 0 → always Perfect.\n\n<font color='#F5A623'><b>Windows:</b></font>\n⬜ Perfect: immediate\n🟣 Sick: +45ms\n🟢 Good: +75ms\n🟡 Ok: +125ms\n🔴 Bad: +175ms"
 })
 
 -- ── Groupboxes ────────────────────────────────
@@ -384,7 +372,7 @@ local chanceGroup = mainTab:AddRightGroupbox("ChanceGroup", { Text = "🎲 Hit C
 local miscGroup   = miscTab:AddLeftGroupbox( "MiscGroup",   { Text = "🎭 Platform Display" })
 local themeGroup  = settingsTab:AddLeftGroupbox("ThemeGroup", { Text = "🎨 Theme" })
 
--- ── Auto Player group ─────────────────────────
+-- ── Auto Player ───────────────────────────────
 apGroup:AddToggle("AutoPlayerEnabled", {
     Text    = "Enable",
     Value   = false,
@@ -392,13 +380,19 @@ apGroup:AddToggle("AutoPlayerEnabled", {
     Callback = function(val)
         v8 = val
         if v8 then
-            holdCache = {}; cacheBuilt = {}
+            v6 = {}
+            laneHeld    = {false,false,false,false}
+            laneHolding = {false,false,false,false}
+            pendingHold = {nil,nil,nil,nil}
             for _, k in pairs(v4.KeyBinds) do doRelease(k) end
             startLoop()
             window:Notification({ Title = "✅ AutoPlayer", Text = "Turned <font color='#5BC8F5'><b>ON</b></font>", Duration = 2 })
         else
             for _, k in pairs(v4.KeyBinds) do doRelease(k) end
             if mainLoop then mainLoop:Disconnect(); mainLoop = nil end
+            laneHeld    = {false,false,false,false}
+            laneHolding = {false,false,false,false}
+            pendingHold = {nil,nil,nil,nil}
             window:Notification({ Title = "❌ AutoPlayer", Text = "Turned <font color='#F5A623'><b>OFF</b></font>", Duration = 2 })
         end
     end,
@@ -409,7 +403,7 @@ apGroup:AddSeparator("APSep1", {})
 apGroup:AddToggle("MissJacks", {
     Text    = "Miss Jack Notes",
     Value   = false,
-    Tooltip = "Intentionally skips rapid same-key notes to look more human",
+    Tooltip = "Skips rapid same-key notes",
     Callback = function(val) missJacks = val end,
 })
 
@@ -418,7 +412,7 @@ apGroup:AddSeparator("APSep2", {})
 apGroup:AddToggle("LegitMode", {
     Text    = "Legit Mode",
     Value   = false,
-    Tooltip = "Caps KPS and biases hit ratings toward Sick/Good to appear human",
+    Tooltip = "Caps KPS and biases ratings toward Sick/Good",
     Callback = function(val)
         legitMode = val
         if val then
@@ -439,7 +433,7 @@ apGroup:AddToggle("LegitMode", {
 apGroup:AddSlider("LegitKpsLimit", {
     Text    = "KPS Limit",
     Min     = 1, Max = 100, Value = 100, Step = 1,
-    Tooltip = "Maximum key presses per second when Legit Mode is active",
+    Tooltip = "Max KPS in Legit Mode",
     Callback = function(val) legitKpsLimit = val end,
 })
 
@@ -448,20 +442,17 @@ apGroup:AddSeparator("APSep3", {})
 apGroup:AddToggle("Perfected", {
     Text    = "Perfected",
     Value   = false,
-    Tooltip = "RenderStepped + synchronous press — tightest possible timing for Perfect hits",
+    Tooltip = "RenderStepped + sync press — tightest possible timing",
     Callback = function(val)
         perfected = val
         if val then minReaction = 0; maxReaction = 0 end
-        -- Restart loop on the right signal for the new mode
         if v8 then
             if mainLoop then mainLoop:Disconnect(); mainLoop = nil end
             startLoop()
         end
         window:Notification({
             Title = "Perfected",
-            Text  = val
-                and "<font color='#5BC8F5'>ON</font> — RenderStepped, 0 yields"
-                or  "<font color='#F5A623'>OFF</font>",
+            Text  = val and "<font color='#5BC8F5'>ON</font>" or "<font color='#F5A623'>OFF</font>",
             Duration = 2
         })
     end,
@@ -471,71 +462,50 @@ apGroup:AddToggle("Perfected", {
 playerGroup:AddSlider("MinReaction", {
     Text    = "Min Reaction (ms)",
     Min     = 0, Max = 150, Value = 0, Step = 1,
-    Tooltip = "Minimum random reaction delay added before pressing. Ignored when Perfected is ON.",
-    Callback = function(val)
-        if not perfected then minReaction = math.floor(val) end
-    end,
+    Tooltip = "Minimum reaction delay. Ignored when Perfected is ON.",
+    Callback = function(val) if not perfected then minReaction = math.floor(val) end end,
 })
 playerGroup:AddSlider("MaxReaction", {
     Text    = "Max Reaction (ms)",
     Min     = 0, Max = 150, Value = 0, Step = 1,
-    Tooltip = "Maximum random reaction delay added before pressing. Ignored when Perfected is ON.",
-    Callback = function(val)
-        if not perfected then maxReaction = math.floor(val) end
-    end,
+    Tooltip = "Maximum reaction delay. Ignored when Perfected is ON.",
+    Callback = function(val) if not perfected then maxReaction = math.floor(val) end end,
 })
-
 
 -- ── Hit Chances ───────────────────────────────
--- These are WEIGHTS, not percentages. The script builds a pool with
--- (weight) entries per rating and picks one at random.
--- All sliders at 0 → always Perfect (pool empty → default Perfect).
--- Legit Mode overrides these with its own preset while active.
 chanceGroup:AddLabel("ChanceInfo", {
-    Text = "<font color='#F5A623'><b>Weights, not percentages.</b></font>\nPerfect=100, rest=0 → always Perfect.\nPerfect=1, Sick=1 → 50/50 Perfect/Sick.\nAll 0 → always Perfect.\n\n<font color='#888'>Locked while Legit Mode is ON.</font>"
+    Text = "<font color='#F5A623'><b>Weights, not %.</b></font>\nAll 0 → always Perfect.\nLocked while Legit Mode is ON."
 })
-chanceGroup:AddSeparator("ChanceSep1", {})
+chanceGroup:AddSeparator("ChanceSep", {})
 chanceGroup:AddSlider("PerfectChance", {
     Text = "Perfect", Min = 0, Max = 100, Value = 100, Step = 1,
-    Tooltip = "Weight for Perfect (press immediately on detection — earliest hit window)",
-    Callback = function(val)
-        if not legitMode then perfectChance = math.floor(val) end
-    end,
+    Tooltip = "Weight for Perfect",
+    Callback = function(val) if not legitMode then perfectChance = math.floor(val) end end,
 })
 chanceGroup:AddSlider("SickChance", {
     Text = "Sick", Min = 0, Max = 100, Value = 0, Step = 1,
-    Tooltip = "Weight for Sick (~45ms after detection)",
-    Callback = function(val)
-        if not legitMode then sickChance = math.floor(val) end
-    end,
+    Tooltip = "Weight for Sick +45ms",
+    Callback = function(val) if not legitMode then sickChance = math.floor(val) end end,
 })
 chanceGroup:AddSlider("GoodChance", {
     Text = "Good", Min = 0, Max = 100, Value = 0, Step = 1,
-    Tooltip = "Weight for Good (~75ms after detection)",
-    Callback = function(val)
-        if not legitMode then goodChance = math.floor(val) end
-    end,
+    Tooltip = "Weight for Good +75ms",
+    Callback = function(val) if not legitMode then goodChance = math.floor(val) end end,
 })
 chanceGroup:AddSlider("OkChance", {
     Text = "Ok", Min = 0, Max = 100, Value = 0, Step = 1,
-    Tooltip = "Weight for Ok (~125ms after detection)",
-    Callback = function(val)
-        if not legitMode then okChance = math.floor(val) end
-    end,
+    Tooltip = "Weight for Ok +125ms",
+    Callback = function(val) if not legitMode then okChance = math.floor(val) end end,
 })
 chanceGroup:AddSlider("BadChance", {
     Text = "Bad", Min = 0, Max = 100, Value = 0, Step = 1,
-    Tooltip = "Weight for Bad (~175ms after detection)",
-    Callback = function(val)
-        if not legitMode then badChance = math.floor(val) end
-    end,
+    Tooltip = "Weight for Bad +175ms",
+    Callback = function(val) if not legitMode then badChance = math.floor(val) end end,
 })
 chanceGroup:AddSlider("MissChance", {
     Text = "Miss", Min = 0, Max = 100, Value = 0, Step = 1,
-    Tooltip = "Weight for intentional miss (note is ignored entirely)",
-    Callback = function(val)
-        if not legitMode then missChance = math.floor(val) end
-    end,
+    Tooltip = "Weight for intentional miss",
+    Callback = function(val) if not legitMode then missChance = math.floor(val) end end,
 })
 
 -- ── Misc tab ──────────────────────────────────
@@ -586,7 +556,7 @@ miscGroup:AddButton("ApplyPlatform", {
             Alert(); return
         end
         local Rejoin = Instance.new("BindableFunction")
-            Rejoin.OnInvoke = function(Ans)
+        Rejoin.OnInvoke = function(Ans)
             if Ans == "Yes" and platformAutoRejoin then
                 if #P:GetPlayers() <= 1 then
                     Spk:Kick("\nRejoining..."); task.wait()
