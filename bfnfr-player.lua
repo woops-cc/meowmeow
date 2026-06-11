@@ -30,68 +30,55 @@ local window = lib:Window("w0opsie_ap", {
 })
 
 -- ── Icon + Background fix ─────────────────────
--- IMPORTANT: downloadAsset is deferred — never runs at top-level so it
--- cannot block or interfere with lib:Window() or any other init code.
+-- The library's setIcon sets .Image but not .ImageContent.
+-- On newer Roblox clients, ImageContent is what actually renders.
+-- We hook GetPropertyChangedSignal("Image") to mirror every .Image
+-- change into .ImageContent via Content.fromUri, with a re-entrancy
+-- guard so we don't loop. Delete any bad cached files first.
 task.defer(function()
-    task.wait(3) -- wait for library's internal spawn() icon download
-
-    -- Download a Roblox asset as a local file and return a rbxasset:// URI.
-    -- getcustomasset is the only reliable way to get images rendering on
-    -- newer Roblox clients without needing the protected ImageContent API.
-    local function downloadAsset(assetId, filename)
-        if not (getcustomasset and writefile and isfile) then return nil end
-        pcall(function() makefolder("w0opsie_cache") end)
-        local path = "w0opsie_cache/" .. filename
-        if not isfile(path) then
-            local ok, data = pcall(game.HttpGet, game,
-                "https://assetdelivery.roblox.com/v1/asset/?id=" .. assetId)
-            if not ok or not data or #data < 100 then return nil end
-            local wok = pcall(writefile, path, data)
-            if not wok then return nil end
+    -- Delete bad cached files from previous attempts (they contain HTML not PNG)
+    pcall(function()
+        if isfile and isfile("w0opsie_cache/icon.png") then
+            delfile("w0opsie_cache/icon.png")
         end
-        local ok2, uri = pcall(getcustomasset, path)
-        return ok2 and uri or nil
-    end
+    end)
+    pcall(function()
+        if isfile and isfile("w0opsie_cache/bg.png") then
+            delfile("w0opsie_cache/bg.png")
+        end
+    end)
 
-    -- Watch .Image and keep it pinned to our URI so library Refresh() calls
-    -- don't overwrite it. Guard with a flag to avoid re-entrancy.
-    local function applyAndWatch(inst, uri)
+    task.wait(3) -- wait for library's internal spawn() download
+
+    local function mirrorImageContent(inst)
         if not inst then return end
         local busy = false
-        local function apply()
-            if busy then return end
+        local function sync()
+            if busy or not inst.Image or inst.Image == "" then return end
             busy = true
-            pcall(function() inst.Image = uri end)
+            pcall(function()
+                inst.ImageContent = Content.fromUri(inst.Image)
+            end)
             busy = false
         end
-        apply()
-        inst:GetPropertyChangedSignal("Image"):Connect(function()
-            if inst.Image ~= uri then apply() end
-        end)
+        sync()
+        inst:GetPropertyChangedSignal("Image"):Connect(sync)
     end
 
-    local bgUri   = downloadAsset("113037548508433", "bg.png")
-                 or "rbxassetid://113037548508433"
-    local iconUri = downloadAsset("71140941882804",  "icon.png")
-                 or "rbxassetid://71140941882804"
-
-    -- Background (RealWindow is an ImageLabel)
+    -- Background
     pcall(function()
-        applyAndWatch(window.Window.RealWindow, bgUri)
+        mirrorImageContent(window.Window.RealWindow)
     end)
-
     -- Topbar icon
     pcall(function()
-        applyAndWatch(
-            window.Window.RealWindow.Contents.TopbarZone.TitleZone.Icon,
-            iconUri
+        mirrorImageContent(
+            window.Window.RealWindow.Contents.TopbarZone.TitleZone.Icon
         )
     end)
-
     -- Mobile button icon (top-right corner)
     pcall(function()
         local btn = window.MobileButton.CanvasGroup.ImageLabel
-        applyAndWatch(btn, iconUri)
+        mirrorImageContent(btn)
         btn.Visible = true
     end)
 end)
@@ -107,12 +94,14 @@ local HIT_OFFSETS = {
 
 local v4 = {
     KeyBinds    = {Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.W, Enum.KeyCode.D},
+    -- HitPixels: detection radius for both regular notes and hold frames.
+    -- Hold frames are released when a NEW note enters this same radius,
+    -- or when the hold frame leaves the game tree.
     HitPixels   = 20,
     TapDuration = 0.05,
 }
 
 local v5 = Players.LocalPlayer
-local v6 = {}
 local v8 = false
 local missJacks  = false
 local legitMode  = false
@@ -123,6 +112,7 @@ local kpsLog     = {}
 
 local laneHeld    = {false,false,false,false}
 local laneHolding = {false,false,false,false}
+-- pendingHold[i]: the Hold_ Frame currently in the hit window for lane i
 local pendingHold = {nil,nil,nil,nil}
 
 local minReaction   = 0
@@ -175,29 +165,13 @@ local function canPress()
     return true
 end
 
--- ── Hold release watcher ──────────────────────
-local function watchHoldRelease(ai, holdFrame)
-    local key = v4.KeyBinds[ai]
-    local released = false
-    local function release()
-        if released then return end
-        released = true
-        laneHolding[ai] = false
-        doRelease(key)
-    end
-    holdFrame.AncestryChanged:Connect(function()
-        if not holdFrame:IsDescendantOf(game) then release() end
-    end)
-    local conn
-    conn = RunService.Heartbeat:Connect(function()
-        if released then conn:Disconnect(); return end
-        if not holdFrame:IsDescendantOf(game) then
-            release(); conn:Disconnect()
-        end
-    end)
-end
-
 -- ── Note handler ──────────────────────────────
+-- FIX (hold release): We no longer use AncestryChanged or property watches
+-- to detect hold end. Instead:
+-- • When holding, we KEEP holding until the NEXT note or Hold_ frame enters
+--   the hit window on that lane — then we release and process the new note.
+-- • As a safety fallback we also release if the Hold_ frame leaves the tree.
+-- This matches real player behaviour: you release when the next thing comes.
 local function handleNote(ai, note, sync)
     local key = v4.KeyBinds[ai]
     if laneHolding[ai] then return end
@@ -227,7 +201,13 @@ local function handleNote(ai, note, sync)
             doRelease(key)
             if not sync then task.wait() end
             doPress(key)
-            watchHoldRelease(ai, holdFrame)
+            -- Safety fallback: release if frame leaves tree unexpectedly
+            holdFrame.AncestryChanged:Connect(function()
+                if not holdFrame:IsDescendantOf(game) and laneHolding[ai] then
+                    laneHolding[ai] = false
+                    doRelease(key)
+                end
+            end)
         else
             laneHeld[ai] = true
             doRelease(key)
@@ -282,9 +262,6 @@ local function getMyKeySync()
 end
 
 -- ── Main loop ─────────────────────────────────
--- Hold_ frames are detected by PROXIMITY (same HitPixels check as regular
--- notes). pendingHold[i] is only set when the Hold_ Frame is actually at
--- the receptor — never on ChildAdded — so no premature holds.
 local function startLoop()
     if mainLoop then mainLoop:Disconnect(); mainLoop = nil end
 
@@ -305,7 +282,6 @@ local function startLoop()
 
             if not cacheBuilt[i] then
                 cacheBuilt[i] = true
-                -- Only used for cleanup: clear seen tables when notes removed
                 n.ChildAdded:Connect(function(c)
                     c.AncestryChanged:Connect(function()
                         if not c:IsDescendantOf(game) then
@@ -319,8 +295,6 @@ local function startLoop()
                 end)
             end
 
-            if laneHolding[i] then continue end
-
             local ty = r.AbsolutePosition.Y
 
             for _, child in pairs(n:GetChildren()) do
@@ -332,15 +306,28 @@ local function startLoop()
                 if dist > v4.HitPixels then continue end
 
                 if child.Name:sub(1,5) == "Hold_" then
-                    -- Hold frame at receptor: register as pending
                     if not seenHolds[child] then
                         seenHolds[child] = true
+                        -- FIX (hold release): if we're already holding on this
+                        -- lane and a new Hold_ frame enters the hit window,
+                        -- release the old hold and register the new one.
+                        if laneHolding[i] then
+                            laneHolding[i] = false
+                            doRelease(v4.KeyBinds[i])
+                        end
                         pendingHold[i] = child
                     end
                 else
-                    -- Regular note at receptor
                     if seenNotes[child] then continue end
                     seenNotes[child] = true
+
+                    -- FIX (hold release): if we're holding and a regular note
+                    -- enters the hit window, release the hold first.
+                    if laneHolding[i] then
+                        laneHolding[i] = false
+                        doRelease(v4.KeyBinds[i])
+                    end
+
                     handleNote(i, child, sync)
                     child.AncestryChanged:Once(function()
                         seenNotes[child] = nil
@@ -405,7 +392,6 @@ apGroup:AddToggle("AutoPlayerEnabled", {
     Callback = function(val)
         v8 = val
         if v8 then
-            v6 = {}
             laneHeld    = {false,false,false,false}
             laneHolding = {false,false,false,false}
             pendingHold = {nil,nil,nil,nil}
@@ -541,7 +527,7 @@ miscGroup:AddToggle("PlatformAutoRejoin", {
     Callback = function(val) platformAutoRejoin = val end,
 })
 miscGroup:AddTextBox("PlatformContent", {
-    Text            = "Display Content",
+  Text            = "Display Content",
     Value           = "😇",
     PlaceholderText = "Enter text or emoji...",
     Callback        = function(val)
