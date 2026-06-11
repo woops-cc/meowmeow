@@ -30,59 +30,44 @@ local window = lib:Window("w0opsie_ap", {
 })
 
 -- ── Icon + Background fix ─────────────────────
--- setIcon() in the library only sets .Image, but Roblox now needs
--- .ImageContent = Content.fromUri() to actually render images.
--- We wait for the library's async spawn() download to finish, then
--- patch both targets and watch .Image to re-apply .ImageContent
--- whenever window:Refresh() overwrites it.
+-- The library's setIcon sets .Image but NOT .ImageContent.
+-- Newer Roblox requires .ImageContent = Content.fromUri(uri).
+-- We patch after 3s (library uses spawn() for async download),
+-- then watch .Image changes to re-apply — but guard against
+-- re-entrancy (setting .Image fires the signal again).
 task.defer(function()
-    task.wait(3) -- wait for library's spawn() icon download
+    task.wait(3)
 
-    local ok, rw = pcall(function() return window.Window.RealWindow end)
-    if ok and rw then
-        local uri = "rbxassetid://113037548508433"
-        local function applyBg()
-            pcall(function() rw.Image = uri end)
-            pcall(function() rw.ImageContent = Content.fromUri(uri) end)
+    local function patchImg(inst, uri)
+        if not inst then return end
+        local patching = false
+        local function apply()
+            if patching then return end
+            patching = true
+            pcall(function() inst.Image = uri end)
+            pcall(function() inst.ImageContent = Content.fromUri(uri) end)
+            patching = false
         end
-        applyBg()
-        rw:GetPropertyChangedSignal("Image"):Connect(function()
-            if rw.Image ~= uri then applyBg() end
+        apply()
+        inst:GetPropertyChangedSignal("Image"):Connect(function()
+            if inst.Image ~= uri then apply() end
         end)
     end
 
-    local ok2, icon = pcall(function()
-        return window.Window.RealWindow.Contents.TopbarZone.TitleZone.Icon
+    pcall(function()
+        patchImg(window.Window.RealWindow, "rbxassetid://113037548508433")
     end)
-    if ok2 and icon then
-        local uri2 = "rbxassetid://71140941882804"
-        local function applyIcon()
-            pcall(function() icon.Image = uri2 end)
-            pcall(function() icon.ImageContent = Content.fromUri(uri2) end)
-            icon.Visible = true
-        end
-        applyIcon()
-        icon:GetPropertyChangedSignal("Image"):Connect(function()
-            if icon.Image ~= uri2 then applyIcon() end
-        end)
-    end
-
-    -- Also patch the mobile button icon (top-right corner)
-    local ok3, btn = pcall(function()
-        return window.Window.MobileButton.CanvasGroup.ImageLabel
+    pcall(function()
+        patchImg(
+            window.Window.RealWindow.Contents.TopbarZone.TitleZone.Icon,
+            "rbxassetid://71140941882804"
+        )
     end)
-    if ok3 and btn then
-        local uri3 = "rbxassetid://71140941882804"
-        local function applyBtn()
-            pcall(function() btn.Image = uri3 end)
-            pcall(function() btn.ImageContent = Content.fromUri(uri3) end)
-            btn.Visible = true
-        end
-        applyBtn()
-        btn:GetPropertyChangedSignal("Image"):Connect(function()
-            if btn.Image ~= uri3 then applyBtn() end
-        end)
-    end
+    pcall(function()
+        local btn = window.MobileButton.CanvasGroup.ImageLabel
+        patchImg(btn, "rbxassetid://71140941882804")
+        btn.Visible = true
+    end)
 end)
 
 -- ── Services ──────────────────────────────────
@@ -90,12 +75,8 @@ local RunService = game:GetService("RunService")
 local VIM        = game:GetService("VirtualInputManager")
 local Players    = game:GetService("Players")
 
--- ── Hit window offsets ────────────────────────
 local HIT_OFFSETS = {
-    sick = 0.045,
-    good = 0.075,
-    ok   = 0.125,
-    bad  = 0.175,
+    sick = 0.045, good = 0.075, ok = 0.125, bad = 0.175,
 }
 
 local v4 = {
@@ -104,9 +85,9 @@ local v4 = {
     TapDuration = 0.05,
 }
 
-local v5         = Players.LocalPlayer
-local v6         = {}   -- dedup guard for regular notes
-local v8         = false
+local v5 = Players.LocalPlayer
+local v6 = {}       -- regular note dedup
+local v8 = false
 local missJacks  = false
 local legitMode  = false
 local perfected  = false
@@ -115,8 +96,12 @@ local heldKeys   = {}
 local kpsLog     = {}
 
 -- Per-lane state
-local laneHeld    = {false, false, false, false} -- key currently held for lane i
-local laneHoldActive = {false, false, false, false} -- hold note active for lane i
+-- laneHeld[i]:      currently doing a tap press on lane i
+-- laneHolding[i]:   currently holding a hold note on lane i
+-- pendingHold[i]:   a Hold_ frame is in Notes but head not yet at receptor
+local laneHeld    = {false,false,false,false}
+local laneHolding = {false,false,false,false}
+local pendingHold = {nil, nil, nil, nil} -- stores the Hold_ frame
 
 local minReaction   = 0
 local maxReaction   = 0
@@ -144,7 +129,6 @@ local function doRelease(key)
     end
 end
 
--- ── Rating pool ───────────────────────────────
 local function pickRating()
     local pool = {}
     for _=1,perfectChance do table.insert(pool,"perfect") end
@@ -169,35 +153,24 @@ local function canPress()
     return true
 end
 
--- ── Hold note handler ─────────────────────────
--- Called when a Hold_N Frame appears in Notes for lane ai.
--- Holds the key immediately and releases ONLY when the Frame
--- is removed from the game tree (AncestryChanged).
--- This is the ONLY reliable signal — confirmed by diagnostic.
-local function handleHold(ai, holdFrame)
+-- ── Hold release watcher ──────────────────────
+-- Watches a Hold_ Frame and releases the key when it leaves the tree.
+-- Called once the head note has been pressed (key is already held).
+local function watchHoldRelease(ai, holdFrame)
     local key = v4.KeyBinds[ai]
-    if laneHoldActive[ai] then return end -- already holding for this lane
-    laneHoldActive[ai] = true
-
-    doRelease(key) -- clean state
-    doPress(key)   -- hold key down
-
     local released = false
     local function release()
         if released then return end
         released = true
-        laneHoldActive[ai] = false
+        laneHolding[ai] = false
+        pendingHold[ai]  = nil
         doRelease(key)
     end
 
-    -- Primary: frame removed from tree
     holdFrame.AncestryChanged:Connect(function()
-        if not holdFrame:IsDescendantOf(game) then
-            release()
-        end
+        if not holdFrame:IsDescendantOf(game) then release() end
     end)
 
-    -- Fallback: Heartbeat checks if frame is gone (catches edge cases)
     local conn
     conn = RunService.Heartbeat:Connect(function()
         if released then conn:Disconnect(); return end
@@ -207,39 +180,62 @@ local function handleHold(ai, holdFrame)
     end)
 end
 
--- ── Regular note handler ──────────────────────
+-- ── Note handler ──────────────────────────────
+-- Called when a note (regular or hold head) reaches the receptor.
+-- If pendingHold[ai] is set, this note is the head of a hold — press
+-- and hold instead of tap.
 local function handleNote(ai, note, sync)
     local key = v4.KeyBinds[ai]
 
-    -- Don't tap if we're already holding for this lane
-    if laneHoldActive[ai] then return end
+    if laneHolding[ai] then return end -- already holding, ignore
 
-    -- Jack: same lane already pressed
-    if laneHeld[ai] then
-        if missJacks then return end
-        if not sync then
-            task.spawn(function()
-                doRelease(key); task.wait(0.02)
-                doPress(key); task.wait(v4.TapDuration); doRelease(key)
-            end)
+    local isHold = pendingHold[ai] ~= nil
+    local holdFrame = pendingHold[ai]
+
+    if not isHold then
+        -- Regular tap: jack check
+        if laneHeld[ai] then
+            if missJacks then return end
+            if not sync then
+                task.spawn(function()
+                    doRelease(key); task.wait(0.02)
+                    doPress(key); task.wait(v4.TapDuration); doRelease(key)
+                end)
+            end
+            return
         end
-        return
     end
 
-    laneHeld[ai] = true
-
     local function pressPath()
-        if not canPress() then laneHeld[ai]=false; return end
-        doRelease(key)
-        if not sync then task.wait() end
-        doPress(key)
-        task.delay(v4.TapDuration, function()
+        if not canPress() then
+            if not isHold then laneHeld[ai] = false end
+            return
+        end
+
+        if isHold then
+            -- Hold: press and keep held, release when Hold_ frame removed
+            laneHolding[ai] = true
+            pendingHold[ai]  = nil
             doRelease(key)
-            laneHeld[ai] = false
-        end)
+            if not sync then task.wait() end
+            doPress(key)
+            watchHoldRelease(ai, holdFrame)
+        else
+            -- Regular tap
+            laneHeld[ai] = true
+            doRelease(key)
+            if not sync then task.wait() end
+            doPress(key)
+            task.delay(v4.TapDuration, function()
+                doRelease(key)
+                laneHeld[ai] = false
+            end)
+        end
     end
 
     if sync then
+        local rating = pickRating()
+        if rating == "miss" then return end
         pressPath()
     else
         task.spawn(function()
@@ -253,8 +249,14 @@ local function handleNote(ai, note, sync)
                 local off = HIT_OFFSETS[rating]
                 if off then task.wait(off) end
             end
-            if not canPress() then laneHeld[ai]=false; return end
-            if rating == "miss" then laneHeld[ai]=false; return end
+            if not canPress() then
+                if not isHold then laneHeld[ai] = false end
+                return
+            end
+            if rating == "miss" then
+                if not isHold then laneHeld[ai] = false end
+                return
+            end
             pressPath()
         end)
     end
@@ -271,41 +273,34 @@ local function getMyKeySync()
 end
 
 -- ── Main loop ─────────────────────────────────
--- Two completely separate detection paths:
---
--- HOLD NOTES  (Hold_N Frames): detected via ChildAdded on Notes.
---   Hold key immediately, release on AncestryChanged.
---   No position check needed — appearing in Notes IS the trigger.
---
--- REGULAR NOTES (numbered ImageLabels): detected via position proximity
---   to the receptor Arrow in the Heartbeat/RenderStepped loop.
 local function startLoop()
     if mainLoop then mainLoop:Disconnect(); mainLoop = nil end
 
-    -- Per-lane ChildAdded connections for hold detection
-    -- These persist for the session (reconnected on startLoop)
-    local holdConns = {}
-    local seenHolds = {} -- dedup: holdFrame -> true
+    local holdConns  = {}
+    local seenHolds  = {}
+    local cacheBuilt = {}
 
-    local function setupHoldWatcher(i, notesFrame)
+    -- ChildAdded watcher: when a Hold_ Frame appears, register it as
+    -- pendingHold for that lane so the next head note press knows to hold.
+    local function setupLane(i, notesFrame)
         if holdConns[i] then holdConns[i]:Disconnect() end
-        seenHolds[i] = seenHolds[i] or {}
+        seenHolds[i] = {}
         holdConns[i] = notesFrame.ChildAdded:Connect(function(c)
-            -- Hold_ frames are the hold tail notes
             if c.Name:sub(1,5) ~= "Hold_" then return end
             if seenHolds[i][c] then return end
             seenHolds[i][c] = true
-            handleHold(i, c)
-            -- Clean up seen table when hold ends
+            -- Register as pending — the proximity loop will press when
+            -- the head note reaches the receptor
+            pendingHold[i] = c
+            -- Clean up when removed
             c.AncestryChanged:Connect(function()
                 if not c:IsDescendantOf(game) then
                     seenHolds[i][c] = nil
+                    if pendingHold[i] == c then pendingHold[i] = nil end
                 end
             end)
         end)
     end
-
-    local cacheBuilt = {}
 
     local function tick_fn(sync)
         if not v8 then return end
@@ -314,33 +309,29 @@ local function startLoop()
 
         for i = 1, 4 do
             local f = KS:FindFirstChild("Arrow"..i)
-            local r = f and f:FindFirstChild("Arrow")     -- receptor ImageLabel
-            local n = f and f:FindFirstChild("Notes")     -- notes container
+            local r = f and f:FindFirstChild("Arrow")
+            local n = f and f:FindFirstChild("Notes")
             if not (r and n) then continue end
 
-            -- Setup hold watcher once per lane per session
             if not cacheBuilt[i] then
                 cacheBuilt[i] = true
-                setupHoldWatcher(i, n)
+                setupLane(i, n)
             end
 
-            -- Regular note detection: proximity to receptor
-            if laneHoldActive[i] then continue end -- skip while holding
+            if laneHolding[i] then continue end
 
             local ty = r.AbsolutePosition.Y
             for _, note in pairs(n:GetChildren()) do
                 if not note:IsA("GuiObject") then continue end
                 if not note.Visible then continue end
                 if note.Name == "Arrow" then continue end
-                if note.Name:sub(1,5) == "Hold_" then continue end -- skip hold frames
+                if note.Name:sub(1,5) == "Hold_" then continue end
                 if v6[note] then continue end
 
                 if math.abs(note.AbsolutePosition.Y - ty) <= v4.HitPixels then
                     v6[note] = true
                     handleNote(i, note, sync)
-                    note.AncestryChanged:Once(function()
-                        v6[note] = nil
-                    end)
+                    note.AncestryChanged:Once(function() v6[note] = nil end)
                 end
             end
         end
@@ -378,12 +369,12 @@ infoLeft:AddLabel("InfoL3", {
 infoRight:AddLabel("InfoR1", { Text = "<font color='#F5A623'><b>🎮 Feature Guide</b></font>" })
 infoRight:AddSeparator("InfoSepR1", {})
 infoRight:AddLabel("InfoR2", { Text = "<font color='#5BC8F5'><b>Enable</b></font>\nTurns the auto player on/off." })
-infoRight:AddLabel("InfoR3", { Text = "<font color='#5BC8F5'><b>Input</b></font>\nUses VirtualInputManager — the only confirmed working method." })
+infoRight:AddLabel("InfoR3", { Text = "<font color='#5BC8F5'><b>Input</b></font>\nUses VirtualInputManager — confirmed working method." })
 infoRight:AddLabel("InfoR4", { Text = "<font color='#5BC8F5'><b>Miss Jack Notes</b></font>\nSkips rapid same-key notes." })
 infoRight:AddLabel("InfoR5", { Text = "<font color='#5BC8F5'><b>Legit Mode</b></font>\nCaps KPS and biases ratings toward Sick/Good." })
-infoRight:AddLabel("InfoR6", { Text = "<font color='#5BC8F5'><b>Perfected</b></font>\nRenderStepped + synchronous press. Tightest possible timing." })
+infoRight:AddLabel("InfoR6", { Text = "<font color='#5BC8F5'><b>Perfected</b></font>\nRenderStepped + sync press. Tightest timing possible." })
 infoRight:AddLabel("InfoR7", {
-    Text = "<font color='#5BC8F5'><b>Hit Chances</b></font>\nWeights, not percentages.\nPerfect=100, rest=0 → always Perfect.\nAll 0 → always Perfect.\n\n<font color='#F5A623'><b>Windows:</b></font>\n⬜ Perfect: immediate\n🟣 Sick: +45ms\n🟢 Good: +75ms\n🟡 Ok: +125ms\n🔴 Bad: +175ms"
+    Text = "<font color='#5BC8F5'><b>Hit Chances</b></font>\nWeights not percentages.\nAll 0 → always Perfect.\n\n<font color='#F5A623'><b>Windows:</b></font>\n⬜ Perfect: immediate\n🟣 Sick: +45ms\n🟢 Good: +75ms\n🟡 Ok: +125ms\n🔴 Bad: +175ms"
 })
 
 -- ── Groupboxes ────────────────────────────────
@@ -402,16 +393,18 @@ apGroup:AddToggle("AutoPlayerEnabled", {
         v8 = val
         if v8 then
             v6 = {}
-            laneHeld = {false,false,false,false}
-            laneHoldActive = {false,false,false,false}
+            laneHeld    = {false,false,false,false}
+            laneHolding = {false,false,false,false}
+            pendingHold = {nil,nil,nil,nil}
             for _, k in pairs(v4.KeyBinds) do doRelease(k) end
             startLoop()
             window:Notification({ Title = "✅ AutoPlayer", Text = "Turned <font color='#5BC8F5'><b>ON</b></font>", Duration = 2 })
         else
             for _, k in pairs(v4.KeyBinds) do doRelease(k) end
             if mainLoop then mainLoop:Disconnect(); mainLoop = nil end
-            laneHeld = {false,false,false,false}
-            laneHoldActive = {false,false,false,false}
+            laneHeld    = {false,false,false,false}
+            laneHolding = {false,false,false,false}
+            pendingHold = {nil,nil,nil,nil}
             window:Notification({ Title = "❌ AutoPlayer", Text = "Turned <font color='#F5A623'><b>OFF</b></font>", Duration = 2 })
         end
     end,
@@ -422,7 +415,7 @@ apGroup:AddSeparator("APSep1", {})
 apGroup:AddToggle("MissJacks", {
     Text    = "Miss Jack Notes",
     Value   = false,
-    Tooltip = "Intentionally skips rapid same-key notes",
+    Tooltip = "Skips rapid same-key notes",
     Callback = function(val) missJacks = val end,
 })
 
@@ -452,7 +445,7 @@ apGroup:AddToggle("LegitMode", {
 apGroup:AddSlider("LegitKpsLimit", {
     Text    = "KPS Limit",
     Min     = 1, Max = 100, Value = 100, Step = 1,
-    Tooltip = "Max key presses per second in Legit Mode",
+    Tooltip = "Max KPS in Legit Mode",
     Callback = function(val) legitKpsLimit = val end,
 })
 
@@ -498,27 +491,27 @@ chanceGroup:AddLabel("ChanceInfo", {
 chanceGroup:AddSeparator("ChanceSep", {})
 chanceGroup:AddSlider("PerfectChance", {
     Text = "Perfect", Min = 0, Max = 100, Value = 100, Step = 1,
-    Tooltip = "Weight for Perfect — press immediately",
+    Tooltip = "Weight for Perfect",
     Callback = function(val) if not legitMode then perfectChance = math.floor(val) end end,
 })
 chanceGroup:AddSlider("SickChance", {
     Text = "Sick", Min = 0, Max = 100, Value = 0, Step = 1,
-    Tooltip = "Weight for Sick — +45ms",
+    Tooltip = "Weight for Sick +45ms",
     Callback = function(val) if not legitMode then sickChance = math.floor(val) end end,
 })
 chanceGroup:AddSlider("GoodChance", {
     Text = "Good", Min = 0, Max = 100, Value = 0, Step = 1,
-    Tooltip = "Weight for Good — +75ms",
+    Tooltip = "Weight for Good +75ms",
     Callback = function(val) if not legitMode then goodChance = math.floor(val) end end,
 })
 chanceGroup:AddSlider("OkChance", {
     Text = "Ok", Min = 0, Max = 100, Value = 0, Step = 1,
-    Tooltip = "Weight for Ok — +125ms",
+    Tooltip = "Weight for Ok +125ms",
     Callback = function(val) if not legitMode then okChance = math.floor(val) end end,
 })
 chanceGroup:AddSlider("BadChance", {
     Text = "Bad", Min = 0, Max = 100, Value = 0, Step = 1,
-    Tooltip = "Weight for Bad — +175ms",
+    Tooltip = "Weight for Bad +175ms",
     Callback = function(val) if not legitMode then badChance = math.floor(val) end end,
 })
 chanceGroup:AddSlider("MissChance", {
