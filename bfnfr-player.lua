@@ -6,61 +6,92 @@ local C_ORANGE = Color3.fromRGB(245, 166, 35)
 local C_WHITE  = Color3.fromRGB(220, 220, 225)
 local C_BG     = Color3.fromRGB(18,  18,  22)
 
--- ── Icon + Background via getcustomasset ──────
--- The library itself uses getcustomasset (gca) to download images as local
--- files and serve them via rbxasset://, which is the only URL format that
--- reliably updates both .Image and .ImageContent on newer Roblox clients.
--- We replicate that approach: download the PNG, save to disk, use gca.
-local function downloadAsset(assetId, filename)
-    if not (getcustomasset and writefile and isfile) then return nil end
-    local path = "w0opsie_cache/" .. filename
-    if not isfile(path) then
-        local ok, data = pcall(function()
-            return game:HttpGet("https://assetdelivery.roblox.com/v1/asset/?id=" .. assetId, true)
-        end)
-        if not ok or not data or #data < 128 then return nil end
-        pcall(function() makefolder("w0opsie_cache") end)
-        writefile(path, data)
-    end
-    local ok2, asset = pcall(getcustomasset, path)
-    return ok2 and asset or nil
-end
+-- ── Window ────────────────────────────────────
+local window = lib:Window("w0opsie_ap", {
+    Title    = "<font color='#5BC8F5'>w0</font><font color='#F5A623'>o</font><font color='#5BC8F5'>opsie's ap</font>",
+    Icon     = "71140941882804",
+    Footer   = "<font color='#5BC8F5'>Basically FNF: Remix</font>",
+    Keybind  = Enum.KeyCode.RightShift,
+    NeonType      = "Top",
+    NeonThickness = 2,
+    AnimationSpeed     = 1.2,
+    ShadowTransparency = 0.4,
+    ShadowSize         = 20,
+    Image             = "113037548508433",
+    ImageEnabled      = true,
+    ImageTransparency = 0.35,
+    ImageColor        = Color3.new(1, 1, 1),
+    Theme = {
+        Back   = C_BG,
+        Main   = C_BLUE,
+        Stroke = C_ORANGE,
+        Text   = C_WHITE,
+    },
+})
 
--- Apply a local asset URI to an ImageLabel, then watch for library overwrites
-local function applyAndWatch(inst, localUri, fallbackUri)
-    if not inst then return end
-    local function apply()
-        local uri = localUri or fallbackUri
-        pcall(function() inst.Image = uri end)
-        pcall(function() inst.ImageContent = Content.fromUri(uri) end)
-    end
-    apply()
-    inst:GetPropertyChangedSignal("Image"):Connect(function()
-        if inst.Image ~= (localUri or fallbackUri) then apply() end
-    end)
-end
-
+-- ── Icon + Background fix ─────────────────────
+-- IMPORTANT: downloadAsset is deferred — never runs at top-level so it
+-- cannot block or interfere with lib:Window() or any other init code.
 task.defer(function()
-    task.wait(3) -- wait for library's spawn() icon download
+    task.wait(3) -- wait for library's internal spawn() icon download
 
-    -- Download assets via getcustomasset if available
+    -- Download a Roblox asset as a local file and return a rbxasset:// URI.
+    -- getcustomasset is the only reliable way to get images rendering on
+    -- newer Roblox clients without needing the protected ImageContent API.
+    local function downloadAsset(assetId, filename)
+        if not (getcustomasset and writefile and isfile) then return nil end
+        pcall(function() makefolder("w0opsie_cache") end)
+        local path = "w0opsie_cache/" .. filename
+        if not isfile(path) then
+            local ok, data = pcall(game.HttpGet, game,
+                "https://assetdelivery.roblox.com/v1/asset/?id=" .. assetId)
+            if not ok or not data or #data < 100 then return nil end
+            local wok = pcall(writefile, path, data)
+            if not wok then return nil end
+        end
+        local ok2, uri = pcall(getcustomasset, path)
+        return ok2 and uri or nil
+    end
+
+    -- Watch .Image and keep it pinned to our URI so library Refresh() calls
+    -- don't overwrite it. Guard with a flag to avoid re-entrancy.
+    local function applyAndWatch(inst, uri)
+        if not inst then return end
+        local busy = false
+        local function apply()
+            if busy then return end
+            busy = true
+            pcall(function() inst.Image = uri end)
+            busy = false
+        end
+        apply()
+        inst:GetPropertyChangedSignal("Image"):Connect(function()
+            if inst.Image ~= uri then apply() end
+        end)
+    end
+
     local bgUri   = downloadAsset("113037548508433", "bg.png")
-        or "rbxassetid://113037548508433"
+                 or "rbxassetid://113037548508433"
     local iconUri = downloadAsset("71140941882804",  "icon.png")
-        or "rbxassetid://71140941882804"
+                 or "rbxassetid://71140941882804"
 
+    -- Background (RealWindow is an ImageLabel)
     pcall(function()
-        applyAndWatch(window.Window.RealWindow, bgUri, "rbxassetid://113037548508433")
+        applyAndWatch(window.Window.RealWindow, bgUri)
     end)
+
+    -- Topbar icon
     pcall(function()
         applyAndWatch(
             window.Window.RealWindow.Contents.TopbarZone.TitleZone.Icon,
-            iconUri, "rbxassetid://71140941882804"
+            iconUri
         )
     end)
+
+    -- Mobile button icon (top-right corner)
     pcall(function()
         local btn = window.MobileButton.CanvasGroup.ImageLabel
-        applyAndWatch(btn, iconUri, "rbxassetid://71140941882804")
+        applyAndWatch(btn, iconUri)
         btn.Visible = true
     end)
 end)
@@ -92,8 +123,6 @@ local kpsLog     = {}
 
 local laneHeld    = {false,false,false,false}
 local laneHolding = {false,false,false,false}
--- pendingHold[i]: a Hold_ frame that is close enough to the receptor
--- (set by proximity check, not by ChildAdded)
 local pendingHold = {nil,nil,nil,nil}
 
 local minReaction   = 0
@@ -147,8 +176,6 @@ local function canPress()
 end
 
 -- ── Hold release watcher ──────────────────────
--- Called after the key has been pressed for a hold.
--- Releases when the Hold_ Frame leaves the game tree.
 local function watchHoldRelease(ai, holdFrame)
     local key = v4.KeyBinds[ai]
     local released = false
@@ -255,16 +282,14 @@ local function getMyKeySync()
 end
 
 -- ── Main loop ─────────────────────────────────
--- Both regular notes AND Hold_ frames are detected by PROXIMITY to the
--- receptor. Hold_ frames are Frames (no ImageTransparency) — we only
--- set pendingHold when the frame is within HitPixels of the receptor,
--- NOT when it first appears (which was causing early holds).
+-- Hold_ frames are detected by PROXIMITY (same HitPixels check as regular
+-- notes). pendingHold[i] is only set when the Hold_ Frame is actually at
+-- the receptor — never on ChildAdded — so no premature holds.
 local function startLoop()
     if mainLoop then mainLoop:Disconnect(); mainLoop = nil end
 
-    local seenNotes = {}   -- dedup for regular notes already processed
-    local seenHolds = {}   -- dedup for Hold_ frames already registered
-
+    local seenNotes  = {}
+    local seenHolds  = {}
     local cacheBuilt = {}
 
     local function tick_fn(sync)
@@ -278,19 +303,19 @@ local function startLoop()
             local n = f and f:FindFirstChild("Notes")
             if not (r and n) then continue end
 
-            -- Register ChildAdded once to keep seenHolds clean on removal
             if not cacheBuilt[i] then
                 cacheBuilt[i] = true
+                -- Only used for cleanup: clear seen tables when notes removed
                 n.ChildAdded:Connect(function(c)
-                    -- When a Hold_ frame is REMOVED, clear its seen entry
-                    if c.Name:sub(1,5) == "Hold_" then
-                        c.AncestryChanged:Connect(function()
-                            if not c:IsDescendantOf(game) then
-                                seenHolds[c] = nil
-                                if pendingHold[i] == c then pendingHold[i] = nil end
+                    c.AncestryChanged:Connect(function()
+                        if not c:IsDescendantOf(game) then
+                            seenNotes[c] = nil
+                            seenHolds[c] = nil
+                            if pendingHold[i] == c then
+                                pendingHold[i] = nil
                             end
-                        end)
-                    end
+                        end
+                    end)
                 end)
             end
 
@@ -307,7 +332,7 @@ local function startLoop()
                 if dist > v4.HitPixels then continue end
 
                 if child.Name:sub(1,5) == "Hold_" then
-                    -- Hold frame is at receptor — register as pending if not seen
+                    -- Hold frame at receptor: register as pending
                     if not seenHolds[child] then
                         seenHolds[child] = true
                         pendingHold[i] = child
@@ -359,7 +384,7 @@ infoRight:AddSeparator("InfoSepR1", {})
 infoRight:AddLabel("InfoR2", { Text = "<font color='#5BC8F5'><b>Enable</b></font>\nTurns the auto player on/off." })
 infoRight:AddLabel("InfoR3", { Text = "<font color='#5BC8F5'><b>Input</b></font>\nUses VirtualInputManager — confirmed working method." })
 infoRight:AddLabel("InfoR4", { Text = "<font color='#5BC8F5'><b>Miss Jack Notes</b></font>\nSkips rapid same-key notes." })
-infoRight:AddLabel("InfoR5", { Text = "<font color='#5BC8F5'><b>Legit Mode</b></font>\nCaps KPS and biases ratings toward Sick/Good." })
+infoRight:AddLabel("InfoR5", { Text = "<font color='#5BC8F5'><b>Legit Mode</b></font>\nCaps KPS and biases toward Sick/Good." })
 infoRight:AddLabel("InfoR6", { Text = "<font color='#5BC8F5'><b>Perfected</b></font>\nRenderStepped + sync press. Tightest timing possible." })
 infoRight:AddLabel("InfoR7", {
     Text = "<font color='#5BC8F5'><b>Hit Chances</b></font>\nWeights not percentages.\nAll 0 → always Perfect.\n\n<font color='#F5A623'><b>Windows:</b></font>\n⬜ Perfect: immediate\n🟣 Sick: +45ms\n🟢 Good: +75ms\n🟡 Ok: +125ms\n🔴 Bad: +175ms"
