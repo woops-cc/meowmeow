@@ -9,7 +9,7 @@ local C_BG     = Color3.fromRGB(18,  18,  22)
 -- ── Window ────────────────────────────────────
 local window = lib:Window("w0opsie_ap", {
     Title    = "<font color='#5BC8F5'>w0</font><font color='#F5A623'>o</font><font color='#5BC8F5'>opsie's ap</font>",
-    Icon     = "71140941882804",
+    Icon     = "76468651273482",
     Footer   = "<font color='#5BC8F5'>Basically FNF: Remix</font>",
     Keybind  = Enum.KeyCode.RightShift,
     NeonType      = "Top",
@@ -17,7 +17,7 @@ local window = lib:Window("w0opsie_ap", {
     AnimationSpeed     = 1.2,
     ShadowTransparency = 0.4,
     ShadowSize         = 20,
-    Image             = "113037548508433",
+    Image             = "110348582183473",
     ImageEnabled      = true,
     ImageTransparency = 0.35,
     ImageColor        = Color3.new(1, 1, 1),
@@ -32,7 +32,7 @@ local window = lib:Window("w0opsie_ap", {
 -- ── Icon + Background ─────────────────────────
 task.defer(function()
     task.wait(3)
-    local function mirror(inst, label)
+    local function mirror(inst)
         if not inst then return end
         local busy = false
         local function sync()
@@ -46,12 +46,11 @@ task.defer(function()
         sync()
         inst:GetPropertyChangedSignal("Image"):Connect(sync)
     end
-    pcall(function() mirror(window.Window.RealWindow, "bg") end)
-    pcall(function() mirror(window.Window.RealWindow.Contents.TopbarZone.TitleZone.Icon, "icon") end)
+    pcall(function() mirror(window.Window.RealWindow) end)
+    pcall(function() mirror(window.Window.RealWindow.Contents.TopbarZone.TitleZone.Icon) end)
     pcall(function()
         local btn = window.MobileButton.CanvasGroup.ImageLabel
-        mirror(btn, "mobileicon")
-        btn.Visible = true
+        mirror(btn); btn.Visible = true
     end)
 end)
 
@@ -60,21 +59,20 @@ local RunService = game:GetService("RunService")
 local VIM        = game:GetService("VirtualInputManager")
 local Players    = game:GetService("Players")
 
--- ── Game constants (from decompiled source) ───
--- NoteInput uses Position.Y.Scale (not AbsolutePosition).
--- Hit window: |scale| <= 2.4 * scrollSpeed clamped to [1,9]
--- Perfect+Sick threshold: |scale / (11 * scrollSpeed)| <= 0.06525
---   → |scale| <= 0.71775 * scrollSpeed
--- We fire VIM when scale is within TRIGGER_SCALE of 0.
--- Setting it slightly larger than the perfect window means VIM
--- delivers the event inside the perfect window accounting for latency.
--- At scroll 2.0: perfect window = ±1.4355 scale units
--- We trigger at ±2.0 to give ~0.5 units of VIM delivery lead time.
-local TRIGGER_SCALE = 1.2 -- scale units before receptor to fire VIM
-
-local HIT_OFFSETS = {
-    sick = 0.045, good = 0.075, ok = 0.125, bad = 0.175,
-}
+-- ── Timing constants (from decompiled source) ─────────────────────────────
+-- Notes spawn at Y.Scale = 11 * scrollSpeed, move to -11 * scrollSpeed
+-- over 4 seconds total (tween speed = 22 * scrollSpeed / 4 per second)
+-- Hit window: |scale| <= 2.4 * scrollSpeed (clamped 1-9)
+-- Perfect+Sick window: |scale| <= 0.71775 * scrollSpeed
+-- Miss threshold: |scale| > 0.6 * scrollSpeed (clamped 0.9-4)
+--
+-- VIM latency on mobile is typically 10-20ms. Notes move at:
+--   (22 * scrollSpeed) scale units / 4 seconds = 5.5 * scrollSpeed units/sec
+-- At 15ms VIM latency: lead = 0.015 * 5.5 * scrollSpeed = 0.0825 * scrollSpeed
+-- We trigger when: |scale| <= perfectWindow + vimLead
+-- perfectWindow = 0.71775 * scrollSpeed, vimLead ~ 0.15 * scrollSpeed (generous)
+-- So trigger at: |scale| <= 0.87 * scrollSpeed
+-- This is computed per-frame using current scrollSpeed from _G.Settings.NoteSpeed
 
 local v4 = {
     KeyBinds    = {Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.W, Enum.KeyCode.D},
@@ -91,13 +89,9 @@ local heldKeys   = {}
 local kpsLog     = {}
 
 local laneHeld      = {false,false,false,false}
--- laneHoldFrame[i]: the Hold_ Frame we're currently holding on lane i
-local laneHoldFrame = {nil,nil,nil,nil}
--- pendingHold[i]: a Hold_ Frame in range waiting to be pressed with the head note
-local pendingHold   = {nil,nil,nil,nil}
--- seenNotes / seenHolds: dedup tables reset on startLoop
-local seenNotes = {}
-local seenHolds = {}
+local laneHoldFrame = {nil,nil,nil,nil} -- Hold_ frame currently being held
+local seenNotes     = {}
+local seenHolds     = {}
 
 local minReaction   = 0
 local maxReaction   = 0
@@ -156,18 +150,54 @@ local function canPress()
     return true
 end
 
+-- ── Hold release watcher ──────────────────────
+-- After the head note is hit, the game moves the Hold_ frame from
+-- Notes into ArrowN.Hold.Hitbox. It stays there until Debris destroys it.
+-- We watch the Hitbox for ChildRemoved to know when the hold is done.
+local function watchHold(ai, arrowFrame, holdFrame)
+    laneHoldFrame[ai] = holdFrame
+    local hitbox = arrowFrame:FindFirstChild("Hold") and
+                   arrowFrame.Hold:FindFirstChild("Hitbox")
+    if not hitbox then
+        -- Fallback: watch holdFrame ancestry directly
+        holdFrame.AncestryChanged:Connect(function()
+            if laneHoldFrame[ai] == holdFrame and
+               not holdFrame:IsDescendantOf(game) then
+                releaseHold(ai)
+            end
+        end)
+        return
+    end
+
+    -- Primary: watch Hitbox.ChildRemoved — fires when Debris destroys holdFrame
+    local conn
+    conn = hitbox.ChildRemoved:Connect(function(child)
+        if child == holdFrame or laneHoldFrame[ai] == holdFrame then
+            releaseHold(ai)
+            conn:Disconnect()
+        end
+    end)
+
+    -- Fallback: ancestry watch on holdFrame itself
+    holdFrame.AncestryChanged:Connect(function()
+        if laneHoldFrame[ai] == holdFrame and
+           not holdFrame:IsDescendantOf(game) then
+            releaseHold(ai)
+            if conn then conn:Disconnect() end
+        end
+    end)
+end
+
 -- ── Note handler ──────────────────────────────
-local function handleNote(ai, note, sync)
+local HIT_OFFSETS = { sick=0.045, good=0.075, ok=0.125, bad=0.175 }
+
+local function handleNote(ai, note, arrowFrame, isHold, holdFrame, sync)
     local key = v4.KeyBinds[ai]
 
-    -- Release any active hold when a new note comes in range
+    -- Release any active hold (new note coming in)
     if laneHoldFrame[ai] then releaseHold(ai) end
 
-    local holdFrame = pendingHold[ai]
-    local isHold    = holdFrame ~= nil
-    if isHold then pendingHold[ai] = nil end
-
-    -- Jack check (only for regular taps)
+    -- Jack check for regular taps
     if not isHold and laneHeld[ai] then
         if missJacks then return end
         if not sync then
@@ -185,22 +215,11 @@ local function handleNote(ai, note, sync)
             return
         end
         doRelease(key)
-        -- Only yield in non-sync (non-perfected) mode
         if not sync then task.wait() end
         doPress(key)
-
         if isHold then
-            -- Track which hold frame we're holding
-            laneHoldFrame[ai] = holdFrame
-            -- Release when the game destroys the hold frame (hold complete)
-            -- The game calls v266.holding.Parent = nil then :Destroy()
-            -- AncestryChanged fires when parent is set to nil
-            holdFrame.AncestryChanged:Connect(function()
-                if laneHoldFrame[ai] == holdFrame and
-                   not holdFrame:IsDescendantOf(game) then
-                    releaseHold(ai)
-                end
-            end)
+            -- Watch for hold completion — release when Debris destroys holdFrame
+            watchHold(ai, arrowFrame, holdFrame)
         else
             laneHeld[ai] = true
             task.delay(v4.TapDuration, function()
@@ -252,12 +271,6 @@ local function getMyKeySync()
 end
 
 -- ── Main loop ─────────────────────────────────
--- KEY INSIGHT from decompiled source:
--- The game uses Position.Y.Scale for hit detection, NOT AbsolutePosition.
--- Scale=0 means at the receptor. Positive scale = above, negative = below
--- (depends on direction). We detect when |scale| <= TRIGGER_SCALE.
--- This is scroll-speed independent and matches the game's own logic exactly.
--- Direction is stored in _G.Settings.Direction (1 = down, -1 = up scroll).
 local function startLoop()
     if mainLoop then mainLoop:Disconnect(); mainLoop = nil end
 
@@ -265,67 +278,85 @@ local function startLoop()
     seenHolds = {}
     local cacheBuilt = {}
 
+    -- pendingHold[i]: a {frame, arrowFrame} pair registered from Notes
+    local pendingHold = {nil,nil,nil,nil}
+
     local function tick_fn(sync)
         if not v8 then return end
         local KS = getMyKeySync()
         if not (KS and KS.Visible) then return end
 
-        -- Get scroll direction from game settings
+        -- Get current scroll speed and direction from game
+        local spd = (_G and _G.Settings and _G.Settings.NoteSpeed) or 2
+        spd = math.clamp(tonumber(spd) or 2, 0.8, 5)
         local dir = (_G and _G.Settings and _G.Settings.Direction) or 1
+
+        -- Trigger window: fire VIM when note is within this scale distance
+        -- perfectWindow = 0.71775 * spd, add ~0.15*spd lead for VIM latency
+        -- This means we fire VIM slightly before the perfect window opens,
+        -- so by the time VIM delivers the key event the note is in the window.
+        local triggerScale = 0.87 * spd
 
         for i = 1, 4 do
             local f = KS:FindFirstChild("Arrow"..i)
             local n = f and f:FindFirstChild("Notes")
-            if not n then continue end
+            if not (f and n) then continue end
 
-            -- Setup cleanup connections once per lane
             if not cacheBuilt[i] then
                 cacheBuilt[i] = true
+                -- Cleanup: remove from seen tables when notes leave tree
                 n.ChildAdded:Connect(function(c)
                     c.AncestryChanged:Connect(function()
                         if not c:IsDescendantOf(game) then
                             seenNotes[c] = nil
                             seenHolds[c] = nil
-                            if pendingHold[i] == c then pendingHold[i] = nil end
+                            if pendingHold[i] and pendingHold[i][1] == c then
+                                pendingHold[i] = nil
+                            end
                         end
                     end)
                 end)
-            end
-
-            -- Release hold if active hold frame was destroyed
-            if laneHoldFrame[i] and not laneHoldFrame[i]:IsDescendantOf(game) then
-                releaseHold(i)
             end
 
             if laneHoldFrame[i] then continue end
 
             for _, child in pairs(n:GetChildren()) do
                 if not child:IsA("GuiObject") then continue end
-                if not child.Visible then continue end
                 if child.Name == "Arrow" then continue end
 
-                -- Use Position.Y.Scale exactly like the game does
                 local scale = child.Position.Y.Scale
                 local dist  = math.abs(scale)
 
-                if dist > TRIGGER_SCALE then continue end
-
-                -- Only trigger on the approaching side (scale moving toward 0)
-                -- dir=1 means notes fall down, scale goes from positive to negative
-                -- We want notes that haven't passed the receptor yet
-                -- (scale * dir > -TRIGGER_SCALE handles both directions)
+                -- Only detect notes approaching from the correct direction
+                -- dir=1: notes fall down, scale goes from positive toward 0
+                -- dir=-1: notes rise up, scale goes from negative toward 0
+                -- We want: scale * dir > 0 (approaching) OR already in window
+                if dist > triggerScale then continue end
 
                 if child.Name:sub(1,5) == "Hold_" then
+                    -- Hold tail frame — register as pending for this lane
                     if not seenHolds[child] then
                         seenHolds[child] = true
-                        if laneHoldFrame[i] then releaseHold(i) end
-                        pendingHold[i] = child
+                        pendingHold[i] = {child, f}
                     end
-                else
-                    if seenNotes[child] then continue end
+                elseif not seenNotes[child] then
+                    -- Regular note (head note, possibly with pending hold)
+                    if not child.Visible then continue end
                     seenNotes[child] = true
+
+                    -- Release any current hold if we have a new note
                     if laneHoldFrame[i] then releaseHold(i) end
-                    handleNote(i, child, sync)
+
+                    -- Check if there's a pending hold frame for this note
+                    -- (hold frame appears in Notes alongside the head note)
+                    local ph = pendingHold[i]
+                    local isHold = ph ~= nil
+                    local holdFrame = isHold and ph[1] or nil
+                    local arrowFrame = isHold and ph[2] or f
+                    if isHold then pendingHold[i] = nil end
+
+                    handleNote(i, child, arrowFrame, isHold, holdFrame, sync)
+
                     child.AncestryChanged:Once(function()
                         seenNotes[child] = nil
                     end)
@@ -356,7 +387,7 @@ infoLeft:AddLabel("InfoL1", {
 })
 infoLeft:AddSeparator("InfoSep1", {})
 infoLeft:AddLabel("InfoL2", {
-    Text = "<font color='#F5A623'><b>📌 Best settings for all Perfects:</b></font>\n• Perfected: <b>ON</b>\n• Min/Max Reaction: <b>0ms</b>\n• Perfect weight: <b>100</b>, rest <b>0</b>\n• Any scroll speed works!"
+    Text = "<font color='#F5A623'><b>📌 Best settings for all Perfects:</b></font>\n• Perfected: <b>ON</b>\n• Min/Max Reaction: <b>0ms</b>\n• Perfect weight: <b>100</b>, rest <b>0</b>\n• Works at <b>any scroll speed</b>"
 })
 infoLeft:AddSeparator("InfoSep2", {})
 infoLeft:AddLabel("InfoL3", {
@@ -369,7 +400,7 @@ infoRight:AddLabel("InfoR2", { Text = "<font color='#5BC8F5'><b>Enable</b></font
 infoRight:AddLabel("InfoR3", { Text = "<font color='#5BC8F5'><b>Input</b></font>\nUses VirtualInputManager — confirmed working." })
 infoRight:AddLabel("InfoR4", { Text = "<font color='#5BC8F5'><b>Miss Jack Notes</b></font>\nSkips rapid same-key notes." })
 infoRight:AddLabel("InfoR5", { Text = "<font color='#5BC8F5'><b>Legit Mode</b></font>\nCaps KPS and biases toward Sick/Good." })
-infoRight:AddLabel("InfoR6", { Text = "<font color='#5BC8F5'><b>Perfected</b></font>\nRenderStepped + zero-yield press.\nDetects notes by Position.Y.Scale (same as game).\nScroll-speed independent." })
+infoRight:AddLabel("InfoR6", { Text = "<font color='#5BC8F5'><b>Perfected</b></font>\nRenderStepped + zero-yield press.\nDetects by Position.Y.Scale (same as game).\nAutomatically calibrated to scroll speed.\nHolds release via Hitbox.ChildRemoved." })
 infoRight:AddLabel("InfoR7", {
     Text = "<font color='#5BC8F5'><b>Hit Chances</b></font>\nWeights not percentages.\nAll 0 → always Perfect.\n\n<font color='#F5A623'><b>Windows:</b></font>\n⬜ Perfect: immediate\n🟣 Sick: +45ms\n🟢 Good: +75ms\n🟡 Ok: +125ms\n🔴 Bad: +175ms"
 })
@@ -391,7 +422,6 @@ apGroup:AddToggle("AutoPlayerEnabled", {
         if v8 then
             laneHeld      = {false,false,false,false}
             laneHoldFrame = {nil,nil,nil,nil}
-            pendingHold   = {nil,nil,nil,nil}
             for _, k in pairs(v4.KeyBinds) do doRelease(k) end
             startLoop()
             window:Notification({ Title = "✅ AutoPlayer", Text = "Turned <font color='#5BC8F5'><b>ON</b></font>", Duration = 2 })
@@ -401,7 +431,6 @@ apGroup:AddToggle("AutoPlayerEnabled", {
             if mainLoop then mainLoop:Disconnect(); mainLoop = nil end
             laneHeld      = {false,false,false,false}
             laneHoldFrame = {nil,nil,nil,nil}
-            pendingHold   = {nil,nil,nil,nil}
             window:Notification({ Title = "❌ AutoPlayer", Text = "Turned <font color='#F5A623'><b>OFF</b></font>", Duration = 2 })
         end
     end,
@@ -451,7 +480,7 @@ apGroup:AddSeparator("APSep3", {})
 apGroup:AddToggle("Perfected", {
     Text    = "Perfected",
     Value   = false,
-    Tooltip = "RenderStepped + zero-yield press. Scroll-speed independent detection.",
+    Tooltip = "RenderStepped + zero-yield. Auto-calibrates to scroll speed.",
     Callback = function(val)
         perfected = val
         if val then minReaction = 0; maxReaction = 0 end
