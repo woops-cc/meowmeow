@@ -70,7 +70,7 @@ local Players    = game:GetService("Players")
 -- delivers the event inside the perfect window accounting for latency.
 -- At scroll 2.0: perfect window = ±1.4355 scale units
 -- We trigger at ±2.0 to give ~0.5 units of VIM delivery lead time.
-local TRIGGER_SCALE = 2.0  -- scale units before receptor to fire VIM
+local TRIGGER_SCALE = 1.05  -- scale units before receptor to fire VIM
 
 local HIT_OFFSETS = {
     sick = 0.045, good = 0.075, ok = 0.125, bad = 0.175,
