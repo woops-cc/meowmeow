@@ -66,19 +66,30 @@ local Players    = game:GetService("Players")
 --     => velocity = 5.5*spd  scale-units / second
 -- • NoteInput accepts when: |scale| / (11*spd) <= 0.06525
 --     => perfect window edge = 0.71775 * spd
--- • We want to fire VIM exactly `vimLatencyMs` before the note
---   reaches the perfect window edge, so it arrives at ~0ms.
 -- • Formula: triggerScale = (0.71775 - latSec * 5.5) * spd
 --
--- HOW TO CALIBRATE:
---   ms counter shows +X  →  raise vimLatencyMs by X
---   ms counter shows -X  →  lower vimLatencyMs by X
---   Screenshots showed +55-67ms at 22ms → start at 80ms
+-- AUTO-LATENCY:
+--   Calibration point from testing: spd=2.4 → 103ms optimal.
+--   Since VIM hardware latency is constant (device-level), the same
+--   ms value is mathematically correct at all scroll speeds.
+--   Auto mode locks to the calibrated value and ignores the slider.
+--   If auto mode produces drift at a different speed, disable it
+--   and tune the slider manually for that speed.
 -- ═══════════════════════════════════════════════════════════════
-local vimLatencyMs = 80  -- START HERE — tune with slider until ms≈0
+local vimLatencyMs   = 103  -- your calibrated value
+local autoLatency    = true -- lock to calibrated value automatically
+local CALIB_LATENCY  = 103  -- known-good latency from user calibration (spd=2.4)
+
+local function getEffectiveLatency()
+    -- Auto mode: always use the calibrated value.
+    -- The formula is already speed-invariant (vimLatencyMs doesn't need
+    -- to change with scroll speed mathematically).
+    return autoLatency and CALIB_LATENCY or vimLatencyMs
+end
 
 local function calcTriggerScale(spd)
-    local coeff = 0.71775 - (vimLatencyMs / 1000) * 5.5
+    local latMs  = getEffectiveLatency()
+    local coeff  = 0.71775 - (latMs / 1000) * 5.5
     coeff = math.clamp(coeff, 0.05, 0.71775)
     return coeff * spd
 end
@@ -99,6 +110,7 @@ local v8 = false          -- autoplay enabled
 local missJacks  = false
 local legitMode  = false
 local perfected  = false
+local antiMiss   = false  -- widen window + catch any slipped note before miss
 local mainLoop   = nil
 
 -- Per-lane hold state
@@ -341,6 +353,11 @@ local function startLoop()
         spd = math.clamp(tonumber(spd) or 2, 0.8, 5)
         local triggerScale = calcTriggerScale(spd)
 
+        -- Anti Miss: also catch notes up to the outer NoteInput detect window
+        -- (2.4*spd, clamped 1-9) so nothing slips past before we see it.
+        -- We still fire at the normal trigger point; this just widens the scan.
+        local antiMissWindow = antiMiss and math.clamp(2.4 * spd, 1, 9) or triggerScale
+
         for lane = 1, 4 do
             local arrowFrame = KS:FindFirstChild("Arrow"..lane)
             local notesFrame = arrowFrame and arrowFrame:FindFirstChild("Notes")
@@ -366,6 +383,11 @@ local function startLoop()
             local bestNote = nil
             local bestDist = math.huge
 
+            -- Anti Miss scans the full outer window (2.4*spd) so any note
+            -- that has slipped past the trigger point is still caught and fired.
+            -- Normal mode only scans within the calibrated trigger window.
+            local scanWindow = antiMiss and antiMissWindow or triggerScale
+
             for _, child in ipairs(notesFrame:GetChildren()) do
                 if not child:IsA("GuiObject") then continue end
                 if child.Name:sub(1,5) == "Hold_" then continue end  -- skip tail
@@ -373,7 +395,7 @@ local function startLoop()
                 if seenNotes[child] then continue end
 
                 local dist = math.abs(child.Position.Y.Scale)
-                if dist <= triggerScale and dist < bestDist then
+                if dist <= scanWindow and dist < bestDist then
                     bestDist = dist
                     bestNote = child
                 end
@@ -449,6 +471,8 @@ infoRight:AddLabel("InfoR3", { Text = "<font color='#5BC8F5'><b>Input</b></font>
 infoRight:AddLabel("InfoR4", { Text = "<font color='#5BC8F5'><b>Miss Jack Notes</b></font>\nSkips rapid same-key notes." })
 infoRight:AddLabel("InfoR5", { Text = "<font color='#5BC8F5'><b>Legit Mode</b></font>\nCaps KPS and biases toward Sick/Good." })
 infoRight:AddLabel("InfoR6", { Text = "<font color='#5BC8F5'><b>Perfected</b></font>\nRenderStepped + zero-yield press.\nDetects by Position.Y.Scale (same as game).\nAutomatically calibrated to scroll speed.\nHolds release via Hitbox.ChildRemoved." })
+infoRight:AddLabel("InfoR6b", { Text = "<font color='#5BC8F5'><b>Anti Miss</b></font>\nWidens scan to full outer detect window.\nCatches any note that slips past the\nnormal trigger point. Toggle ON for\ndense/fast songs where notes get skipped." })
+infoRight:AddLabel("InfoR6c", { Text = "<font color='#5BC8F5'><b>Auto Latency</b></font>\nLocks to your calibrated 103ms value.\nWorks correctly at any scroll speed\n(latency is device-level, speed-invariant).\nDisable to tune manually with the slider." })
 infoRight:AddLabel("InfoR7", {
     Text = "<font color='#5BC8F5'><b>Hit Chances</b></font>\nWeights not percentages.\nAll 0 → always Perfect.\n\n<font color='#F5A623'><b>Windows:</b></font>\nPerfect: immediate\nSick: +45ms\nGood: +75ms\nOk: +125ms\nBad: +175ms"
 })
@@ -548,14 +572,45 @@ apGroup:AddToggle("Perfected", {
     end,
 })
 
+apGroup:AddSeparator("APSep4", {})
+
+apGroup:AddToggle("AntiMiss", {
+    Text    = "Anti Miss",
+    Value   = false,
+    Tooltip = "Widens note scan to the full outer detect window so no note is ever skipped, even on dense/fast patterns.",
+    Callback = function(val)
+        antiMiss = val
+        window:Notification({
+            Title = "Anti Miss",
+            Text  = val and "<font color='#5BC8F5'>ON</font> — scanning full outer window"
+                        or "<font color='#F5A623'>OFF</font>",
+            Duration = 2
+        })
+    end,
+})
 -- ── Player Settings ───────────────────────────
+playerGroup:AddToggle("AutoLatency", {
+    Text    = "Auto Latency",
+    Value   = true,
+    Tooltip = "Automatically uses your calibrated latency (103ms) at any scroll speed. Disable to tune manually.",
+    Callback = function(val)
+        autoLatency = val
+        window:Notification({
+            Title = "Auto Latency",
+            Text  = val
+                and "<font color='#5BC8F5'>ON</font> — using calibrated <b>103ms</b>"
+                or  "<font color='#F5A623'>OFF</font> — use slider below to tune",
+            Duration = 3
+        })
+    end,
+})
 playerGroup:AddLabel("LatencyLabel", {
-    Text = "<font color='#F5A623'><b>VIM Latency Tuning:</b></font>\nms counter <b>positive (+)</b> → raise slider\nms counter <b>negative (-)</b> → lower slider"
+    Text = "<font color='#888'>Manual tuning (Auto Latency OFF):</font>\nms counter <b>+</b> → raise slider\nms counter <b>-</b> → lower slider"
 })
 playerGroup:AddSlider("VimLatency", {
     Text    = "VIM Latency (ms)",
-    Min     = 0, Max = 200, Value = 80, Step = 1,
-    Tooltip = "Raise if ms counter shows +. Lower if ms counter shows -. Tune until ms≈0.",
+    Min     = 0, Max = 200, Value = 103, Step = 1,
+    Tooltip = "Only used when Auto Latency is OFF. Raise if ms counter shows +. Lower if shows -.",
     Callback = function(val) vimLatencyMs = math.floor(val) end,
 })
 playerGroup:AddSeparator("PlayerSep0", {})
