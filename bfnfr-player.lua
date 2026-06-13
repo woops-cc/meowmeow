@@ -61,18 +61,28 @@ local Players    = game:GetService("Players")
 
 -- ── Timing constants (from decompiled source) ─────────────────────────────
 -- Notes spawn at Y.Scale = 11 * scrollSpeed, move to -11 * scrollSpeed
--- over 4 seconds total (tween speed = 22 * scrollSpeed / 4 per second)
--- Hit window: |scale| <= 2.4 * scrollSpeed (clamped 1-9)
--- Perfect+Sick window: |scale| <= 0.71775 * scrollSpeed
--- Miss threshold: |scale| > 0.6 * scrollSpeed (clamped 0.9-4)
+-- over 4 seconds total → note velocity = 5.5 * scrollSpeed scale units/sec
+-- NoteInput accepts hit when: |scale| / (11 * spd) <= 0.06525
+--   → Perfect window = 0.71775 * spd
 --
--- VIM latency on mobile is typically 10-20ms. Notes move at:
---   (22 * scrollSpeed) scale units / 4 seconds = 5.5 * scrollSpeed units/sec
--- At 15ms VIM latency: lead = 0.015 * 5.5 * scrollSpeed = 0.0825 * scrollSpeed
--- We trigger when: |scale| <= perfectWindow + vimLead
--- perfectWindow = 0.71775 * scrollSpeed, vimLead ~ 0.15 * scrollSpeed (generous)
--- So trigger at: |scale| <= 0.87 * scrollSpeed
--- This is computed per-frame using current scrollSpeed from _G.Settings.NoteSpeed
+-- BUG FIX: old trigger was 0.87*spd which fires 27.7ms BEFORE perfect window
+-- even before accounting for VIM latency. Combined with ~22ms VIM delivery
+-- that was ~50ms net error (ms counter showed ~100ms late = we pressed early).
+--
+-- CORRECT formula: trigger = (0.71775 - latency_sec * 5.5) * spd
+--   We fire VIM exactly vimLatencyMs before the perfect edge so the note
+--   reaches scale=0 as VIM delivers the keydown.
+--   vimLatencyMs is tunable (default 22ms). Adjust empirically:
+--     ms counter shows positive → lower vimLatencyMs
+--     ms counter shows negative → raise vimLatencyMs
+local vimLatencyMs = 22  -- tweak this to dial in perfect timing
+
+local function calcTriggerScale(spd)
+    local latSec = vimLatencyMs / 1000
+    local coeff  = 0.71775 - latSec * 5.5
+    coeff = math.clamp(coeff, 0.05, 0.71775)
+    return coeff * spd
+end
 
 local v4 = {
     KeyBinds    = {Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.W, Enum.KeyCode.D},
@@ -151,39 +161,71 @@ local function canPress()
 end
 
 -- ── Hold release watcher ──────────────────────
--- After the head note is hit, the game moves the Hold_ frame from
--- Notes into ArrowN.Hold.Hitbox. It stays there until Debris destroys it.
--- We watch the Hitbox for ChildRemoved to know when the hold is done.
+-- SEQUENCE (from decompiled NoteInput, lines 1018-1033):
+--   1. We detect note + grab holdFrame from Notes BEFORE pressing
+--   2. We call pressKey → NoteInput fires synchronously → moves holdFrame to Hitbox
+--   3. We poll until holdFrame:IsDescendantOf(hitbox) is true (up to 80ms)
+--   4. ONLY THEN connect hitbox.ChildRemoved for our specific frame
+--   5. Debris destroys holdFrame after holdDuration → ChildRemoved fires → release
+--   6. Heartbeat fallback: release if holdFrame leaves game tree entirely
+--
+-- WHY previous approach was broken:
+--   - watchHold was called BEFORE press, so ChildRemoved on Hitbox fired
+--     when the frame was reparented INTO Hitbox (wrong trigger)
+--   - AncestryChanged fires on every reparent, not just destruction
 local function watchHold(ai, arrowFrame, holdFrame)
     laneHoldFrame[ai] = holdFrame
     local hitbox = arrowFrame:FindFirstChild("Hold") and
                    arrowFrame.Hold:FindFirstChild("Hitbox")
+
     if not hitbox then
-        -- Fallback: watch holdFrame ancestry directly
-        holdFrame.AncestryChanged:Connect(function()
-            if laneHoldFrame[ai] == holdFrame and
-               not holdFrame:IsDescendantOf(game) then
-                releaseHold(ai)
+        -- No hitbox found: pure heartbeat fallback
+        task.spawn(function()
+            while laneHoldFrame[ai] == holdFrame do
+                RunService.Heartbeat:Wait()
+                if not holdFrame:IsDescendantOf(game) then
+                    releaseHold(ai); return
+                end
             end
         end)
         return
     end
 
-    -- Primary: watch Hitbox.ChildRemoved — fires when Debris destroys holdFrame
-    local conn
-    conn = hitbox.ChildRemoved:Connect(function(child)
-        if child == holdFrame or laneHoldFrame[ai] == holdFrame then
-            releaseHold(ai)
-            conn:Disconnect()
+    -- Poll until NoteInput has moved holdFrame into Hitbox (happens within 1-2 frames)
+    task.spawn(function()
+        local deadline = tick() + 0.08  -- 80ms max wait (~5 frames at 60fps)
+        while tick() < deadline do
+            if laneHoldFrame[ai] ~= holdFrame then return end  -- cancelled
+            if holdFrame:IsDescendantOf(hitbox) then
+                -- Frame is now in Hitbox. Connect ChildRemoved for THIS frame only.
+                local conn
+                conn = hitbox.ChildRemoved:Connect(function(child)
+                    if child == holdFrame then
+                        conn:Disconnect()
+                        releaseHold(ai)
+                    end
+                end)
+                -- Heartbeat fallback in case ChildRemoved misfires
+                task.spawn(function()
+                    while laneHoldFrame[ai] == holdFrame do
+                        RunService.Heartbeat:Wait()
+                        if not holdFrame:IsDescendantOf(game) then
+                            conn:Disconnect()
+                            releaseHold(ai); return
+                        end
+                    end
+                end)
+                return
+            end
+            if not holdFrame:IsDescendantOf(game) then
+                -- Already destroyed before we could watch (very short hold)
+                releaseHold(ai); return
+            end
+            RunService.Heartbeat:Wait()
         end
-    end)
-
-    -- Fallback: ancestry watch on holdFrame itself
-    holdFrame.AncestryChanged:Connect(function()
-        if laneHoldFrame[ai] == holdFrame and
-           not holdFrame:IsDescendantOf(game) then
+        -- Timeout: frame never arrived in Hitbox — release to avoid stuck key
+        if laneHoldFrame[ai] == holdFrame then
             releaseHold(ai)
-            if conn then conn:Disconnect() end
         end
     end)
 end
@@ -278,24 +320,20 @@ local function startLoop()
     seenHolds = {}
     local cacheBuilt = {}
 
-    -- pendingHold[i]: a {frame, arrowFrame} pair registered from Notes
-    local pendingHold = {nil,nil,nil,nil}
+    -- pendingHold removed: hold frame is named "Hold_<noteName>" per decompiled
+    -- source (v100.Name = "Hold_" .. p90). We look it up directly by name when
+    -- we see a HoldHead note — no pre-registration or ordering dependency needed.
 
     local function tick_fn(sync)
         if not v8 then return end
         local KS = getMyKeySync()
         if not (KS and KS.Visible) then return end
 
-        -- Get current scroll speed and direction from game
         local spd = (_G and _G.Settings and _G.Settings.NoteSpeed) or 2
         spd = math.clamp(tonumber(spd) or 2, 0.8, 5)
-        local dir = (_G and _G.Settings and _G.Settings.Direction) or 1
 
-        -- Trigger window: fire VIM when note is within this scale distance
-        -- perfectWindow = 0.71775 * spd, add ~0.15*spd lead for VIM latency
-        -- This means we fire VIM slightly before the perfect window opens,
-        -- so by the time VIM delivers the key event the note is in the window.
-        local triggerScale = 0.87 * spd
+        -- Trigger window: fire VIM exactly vimLatencyMs before perfect edge
+        local triggerScale = calcTriggerScale(spd)
 
         for i = 1, 4 do
             local f = KS:FindFirstChild("Arrow"..i)
@@ -304,15 +342,11 @@ local function startLoop()
 
             if not cacheBuilt[i] then
                 cacheBuilt[i] = true
-                -- Cleanup: remove from seen tables when notes leave tree
                 n.ChildAdded:Connect(function(c)
                     c.AncestryChanged:Connect(function()
                         if not c:IsDescendantOf(game) then
                             seenNotes[c] = nil
                             seenHolds[c] = nil
-                            if pendingHold[i] and pendingHold[i][1] == c then
-                                pendingHold[i] = nil
-                            end
                         end
                     end)
                 end)
@@ -322,45 +356,28 @@ local function startLoop()
 
             for _, child in pairs(n:GetChildren()) do
                 if not child:IsA("GuiObject") then continue end
+                -- Skip hold tail frames and the static Arrow object
+                if child.Name:sub(1,5) == "Hold_" then continue end
                 if child.Name == "Arrow" then continue end
 
-                local scale = child.Position.Y.Scale
-                local dist  = math.abs(scale)
-
-                -- Only detect notes approaching from the correct direction
-                -- dir=1: notes fall down, scale goes from positive toward 0
-                -- dir=-1: notes rise up, scale goes from negative toward 0
-                -- We want: scale * dir > 0 (approaching) OR already in window
+                local dist = math.abs(child.Position.Y.Scale)
                 if dist > triggerScale then continue end
+                if not child.Visible then continue end
+                if seenNotes[child] then continue end
 
-                if child.Name:sub(1,5) == "Hold_" then
-                    -- Hold tail frame — register as pending for this lane
-                    if not seenHolds[child] then
-                        seenHolds[child] = true
-                        pendingHold[i] = {child, f}
-                    end
-                elseif not seenNotes[child] then
-                    -- Regular note (head note, possibly with pending hold)
-                    if not child.Visible then continue end
-                    seenNotes[child] = true
+                seenNotes[child] = true
 
-                    -- Release any current hold if we have a new note
-                    if laneHoldFrame[i] then releaseHold(i) end
+                if laneHoldFrame[i] then releaseHold(i) end
 
-                    -- Check if there's a pending hold frame for this note
-                    -- (hold frame appears in Notes alongside the head note)
-                    local ph = pendingHold[i]
-                    local isHold = ph ~= nil
-                    local holdFrame = isHold and ph[1] or nil
-                    local arrowFrame = isHold and ph[2] or f
-                    if isHold then pendingHold[i] = nil end
+                -- Detect hold head and locate its tail frame directly by name
+                local isHold    = child:GetAttribute("HoldHead") == true
+                local holdFrame = isHold and n:FindFirstChild("Hold_" .. child.Name) or nil
 
-                    handleNote(i, child, arrowFrame, isHold, holdFrame, sync)
+                handleNote(i, child, f, isHold, holdFrame, sync)
 
-                    child.AncestryChanged:Once(function()
-                        seenNotes[child] = nil
-                    end)
-                end
+                child.AncestryChanged:Once(function()
+                    seenNotes[child] = nil
+                end)
             end
         end
     end
@@ -373,28 +390,28 @@ local function startLoop()
 end
 
 -- ── Tabs ──────────────────────────────────────
-local infoTab     = window:AddTab("InfoTab",     { Text = "📖 Info"     })
-local mainTab     = window:AddTab("MainTab",     { Text = "⚙ Main"     })
-local miscTab     = window:AddTab("MiscTab",     { Text = "🎭 Misc"     })
-local settingsTab = window:AddTab("SettingsTab", { Text = "🎨 Settings" })
+local infoTab     = window:AddTab("InfoTab",     { Text = "Info"     })
+local mainTab     = window:AddTab("MainTab",     { Text = "Main"     })
+local miscTab     = window:AddTab("MiscTab",     { Text = "Misc"     })
+local settingsTab = window:AddTab("SettingsTab", { Text = "Settings" })
 
 -- ── Info tab ──────────────────────────────────
-local infoLeft  = infoTab:AddLeftGroupbox("InfoLeft",  { Text = "👋 Welcome" })
-local infoRight = infoTab:AddRightGroupbox("InfoRight", { Text = "🎵 How It Works" })
+local infoLeft  = infoTab:AddLeftGroupbox("InfoLeft",  { Text = "Welcome" })
+local infoRight = infoTab:AddRightGroupbox("InfoRight", { Text = "How It Works" })
 
 infoLeft:AddLabel("InfoL1", {
-    Text = "<font color='#5BC8F5'><b>w0opsie's Auto Player</b></font>\nMade with 💙 by w0opsie\n\nThis script automatically plays\n<b>Basically FNF: Remix</b> for you!"
+    Text = "<font color='#5BC8F5'><b>w0opsie's Auto Player</b></font>\nMade with love by w0opsie\n\nThis script automatically plays\n<b>Basically FNF: Remix</b> for you!"
 })
 infoLeft:AddSeparator("InfoSep1", {})
 infoLeft:AddLabel("InfoL2", {
-    Text = "<font color='#F5A623'><b>📌 Best settings for all Perfects:</b></font>\n• Perfected: <b>ON</b>\n• Min/Max Reaction: <b>0ms</b>\n• Perfect weight: <b>100</b>, rest <b>0</b>\n• Works at <b>any scroll speed</b>"
+    Text = "<font color='#F5A623'><b>Best settings for all Perfects:</b></font>\n• Perfected: <b>ON</b>\n• Min/Max Reaction: <b>0ms</b>\n• Perfect weight: <b>100</b>, rest <b>0</b>\n• Works at <b>any scroll speed</b>"
 })
 infoLeft:AddSeparator("InfoSep2", {})
 infoLeft:AddLabel("InfoL3", {
-    Text = "<font color='#5BC8F5'><b>⌨ Keybind:</b></font> RightShift = toggle UI"
+    Text = "<font color='#5BC8F5'><b>Keybind:</b></font> RightShift = toggle UI"
 })
 
-infoRight:AddLabel("InfoR1", { Text = "<font color='#F5A623'><b>🎮 Feature Guide</b></font>" })
+infoRight:AddLabel("InfoR1", { Text = "<font color='#F5A623'><b>Feature Guide</b></font>" })
 infoRight:AddSeparator("InfoSepR1", {})
 infoRight:AddLabel("InfoR2", { Text = "<font color='#5BC8F5'><b>Enable</b></font>\nTurns the auto player on/off." })
 infoRight:AddLabel("InfoR3", { Text = "<font color='#5BC8F5'><b>Input</b></font>\nUses VirtualInputManager — confirmed working." })
@@ -402,15 +419,15 @@ infoRight:AddLabel("InfoR4", { Text = "<font color='#5BC8F5'><b>Miss Jack Notes<
 infoRight:AddLabel("InfoR5", { Text = "<font color='#5BC8F5'><b>Legit Mode</b></font>\nCaps KPS and biases toward Sick/Good." })
 infoRight:AddLabel("InfoR6", { Text = "<font color='#5BC8F5'><b>Perfected</b></font>\nRenderStepped + zero-yield press.\nDetects by Position.Y.Scale (same as game).\nAutomatically calibrated to scroll speed.\nHolds release via Hitbox.ChildRemoved." })
 infoRight:AddLabel("InfoR7", {
-    Text = "<font color='#5BC8F5'><b>Hit Chances</b></font>\nWeights not percentages.\nAll 0 → always Perfect.\n\n<font color='#F5A623'><b>Windows:</b></font>\n⬜ Perfect: immediate\n🟣 Sick: +45ms\n🟢 Good: +75ms\n🟡 Ok: +125ms\n🔴 Bad: +175ms"
+    Text = "<font color='#5BC8F5'><b>Hit Chances</b></font>\nWeights not percentages.\nAll 0 → always Perfect.\n\n<font color='#F5A623'><b>Windows:</b></font>\nPerfect: immediate\nSick: +45ms\nGood: +75ms\nOk: +125ms\nBad: +175ms"
 })
 
 -- ── Groupboxes ────────────────────────────────
-local apGroup     = mainTab:AddLeftGroupbox( "APGroup",     { Text = "⚡ Auto Player"     })
-local playerGroup = mainTab:AddLeftGroupbox( "PlayerGroup", { Text = "🎯 Player Settings" })
-local chanceGroup = mainTab:AddRightGroupbox("ChanceGroup", { Text = "🎲 Hit Chances"     })
-local miscGroup   = miscTab:AddLeftGroupbox( "MiscGroup",   { Text = "🎭 Platform Display" })
-local themeGroup  = settingsTab:AddLeftGroupbox("ThemeGroup", { Text = "🎨 Theme" })
+local apGroup     = mainTab:AddLeftGroupbox( "APGroup",     { Text = "Auto Player"     })
+local playerGroup = mainTab:AddLeftGroupbox( "PlayerGroup", { Text = "Player Settings" })
+local chanceGroup = mainTab:AddRightGroupbox("ChanceGroup", { Text = "Hit Chances"     })
+local miscGroup   = miscTab:AddLeftGroupbox( "MiscGroup",   { Text = "Platform Display" })
+local themeGroup  = settingsTab:AddLeftGroupbox("ThemeGroup", { Text = "Theme" })
 
 -- ── Auto Player ───────────────────────────────
 apGroup:AddToggle("AutoPlayerEnabled", {
@@ -424,14 +441,14 @@ apGroup:AddToggle("AutoPlayerEnabled", {
             laneHoldFrame = {nil,nil,nil,nil}
             for _, k in pairs(v4.KeyBinds) do doRelease(k) end
             startLoop()
-            window:Notification({ Title = "✅ AutoPlayer", Text = "Turned <font color='#5BC8F5'><b>ON</b></font>", Duration = 2 })
+            window:Notification({ Title = "AutoPlayer", Text = "Turned <font color='#5BC8F5'><b>ON</b></font>", Duration = 2 })
         else
             for i = 1, 4 do releaseHold(i) end
             for _, k in pairs(v4.KeyBinds) do doRelease(k) end
             if mainLoop then mainLoop:Disconnect(); mainLoop = nil end
             laneHeld      = {false,false,false,false}
             laneHoldFrame = {nil,nil,nil,nil}
-            window:Notification({ Title = "❌ AutoPlayer", Text = "Turned <font color='#F5A623'><b>OFF</b></font>", Duration = 2 })
+            window:Notification({ Title = "AutoPlayer", Text = "Turned <font color='#F5A623'><b>OFF</b></font>", Duration = 2 })
         end
     end,
 })
@@ -497,6 +514,13 @@ apGroup:AddToggle("Perfected", {
 })
 
 -- ── Player Settings ───────────────────────────
+playerGroup:AddSlider("VimLatency", {
+    Text    = "VIM Latency (ms)",
+    Min     = 0, Max = 80, Value = 22, Step = 1,
+    Tooltip = "VIM delivery compensation. Lower if ms counter shows +, raise if shows -.",
+    Callback = function(val) vimLatencyMs = math.floor(val) end,
+})
+playerGroup:AddSeparator("PlayerSep0", {})
 playerGroup:AddSlider("MinReaction", {
     Text    = "Min Reaction (ms)",
     Min     = 0, Max = 150, Value = 0, Step = 1,
@@ -564,16 +588,16 @@ miscGroup:AddButton("ApplyPlatform", {
     Tooltip = "Applies your display content and optionally rejoins",
     Callback = function()
         if game.PlaceId ~= 6520999642 then
-            window:Notification({ Title = "❌ Error", Text = "Wrong game!", Duration = 3 }); return
+            window:Notification({ Title = "Error", Text = "Wrong game!", Duration = 3 }); return
         end
         if not (isfile and readfile and writefile) then
-            window:Notification({ Title = "❌ Error", Text = "Incompatible executor!", Duration = 3 }); return
+            window:Notification({ Title = "Error", Text = "Incompatible executor!", Duration = 3 }); return
         end
         local QueueOnTP = (syn and syn.queue_on_teleport)
             or (fluxus and fluxus.queue_on_teleport)
             or (queue_on_teleport and queue_on_teleport)
         if not QueueOnTP then
-            window:Notification({ Title = "❌ Error", Text = "Missing queue_on_teleport!", Duration = 3 }); return
+            window:Notification({ Title = "Error", Text = "Missing queue_on_teleport!", Duration = 3 }); return
         end
         local Content = platformContent
         writefile("FNFRemixDisplayContent.txt", tostring(Content))
