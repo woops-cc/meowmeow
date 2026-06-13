@@ -59,49 +59,56 @@ local RunService = game:GetService("RunService")
 local VIM        = game:GetService("VirtualInputManager")
 local Players    = game:GetService("Players")
 
--- ── Timing constants (from decompiled source) ─────────────────────────────
--- Notes spawn at Y.Scale = 11 * scrollSpeed, move to -11 * scrollSpeed
--- over 4 seconds total → note velocity = 5.5 * scrollSpeed scale units/sec
--- NoteInput accepts hit when: |scale| / (11 * spd) <= 0.06525
---   → Perfect window = 0.71775 * spd
+-- ═══════════════════════════════════════════════════════════════
+-- TIMING  (from decompiled source w0opsie_songPlay.lua)
+-- ───────────────────────────────────────────────────────────────
+-- • Notes tween: Y.Scale = 11*spd → -(11*spd) over 4 seconds
+--     => velocity = 5.5*spd  scale-units / second
+-- • NoteInput accepts when: |scale| / (11*spd) <= 0.06525
+--     => perfect window edge = 0.71775 * spd
+-- • We want to fire VIM exactly `vimLatencyMs` before the note
+--   reaches the perfect window edge, so it arrives at ~0ms.
+-- • Formula: triggerScale = (0.71775 - latSec * 5.5) * spd
 --
--- BUG FIX: old trigger was 0.87*spd which fires 27.7ms BEFORE perfect window
--- even before accounting for VIM latency. Combined with ~22ms VIM delivery
--- that was ~50ms net error (ms counter showed ~100ms late = we pressed early).
---
--- CORRECT formula: trigger = (0.71775 - latency_sec * 5.5) * spd
---   We fire VIM exactly vimLatencyMs before the perfect edge so the note
---   reaches scale=0 as VIM delivers the keydown.
---   vimLatencyMs is tunable (default 22ms). Adjust empirically:
---     ms counter shows positive → lower vimLatencyMs
---     ms counter shows negative → raise vimLatencyMs
-local vimLatencyMs = 22  -- tweak this to dial in perfect timing
+-- HOW TO CALIBRATE:
+--   ms counter shows +X  →  raise vimLatencyMs by X
+--   ms counter shows -X  →  lower vimLatencyMs by X
+--   Screenshots showed +55-67ms at 22ms → start at 80ms
+-- ═══════════════════════════════════════════════════════════════
+local vimLatencyMs = 80  -- START HERE — tune with slider until ms≈0
 
 local function calcTriggerScale(spd)
-    local latSec = vimLatencyMs / 1000
-    local coeff  = 0.71775 - latSec * 5.5
+    local coeff = 0.71775 - (vimLatencyMs / 1000) * 5.5
     coeff = math.clamp(coeff, 0.05, 0.71775)
     return coeff * spd
 end
 
+-- ═══════════════════════════════════════════════════════════════
+-- KEYBINDS  (must match game's _G.Settings.Inputs)
+-- ═══════════════════════════════════════════════════════════════
 local v4 = {
     KeyBinds    = {Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.W, Enum.KeyCode.D},
     TapDuration = 0.05,
 }
 
+-- ═══════════════════════════════════════════════════════════════
+-- STATE
+-- ═══════════════════════════════════════════════════════════════
 local v5 = Players.LocalPlayer
-local v8 = false
+local v8 = false          -- autoplay enabled
 local missJacks  = false
 local legitMode  = false
 local perfected  = false
 local mainLoop   = nil
-local heldKeys   = {}
-local kpsLog     = {}
 
-local laneHeld      = {false,false,false,false}
-local laneHoldFrame = {nil,nil,nil,nil} -- Hold_ frame currently being held
-local seenNotes     = {}
-local seenHolds     = {}
+-- Per-lane hold state
+-- laneHoldFrame[i]: the Hold_ frame currently in Hitbox being held, or nil
+local laneHoldFrame = {nil, nil, nil, nil}
+
+-- lanePressed[i]: true while VIM key is physically down (not yet released)
+local lanePressed = {false, false, false, false}
+
+local seenNotes = {}   -- [note] = true once dispatched
 
 local minReaction   = 0
 local maxReaction   = 0
@@ -115,26 +122,124 @@ local missChance    = 0
 local platformContent    = "😇"
 local platformAutoRejoin = true
 
--- ── Input ─────────────────────────────────────
-local function doPress(key)
-    if not heldKeys[key] then
-        heldKeys[key] = true
-        VIM:SendKeyEvent(true, key, false, game)
-    end
-end
-local function doRelease(key)
-    if heldKeys[key] then
-        heldKeys[key] = nil
-        VIM:SendKeyEvent(false, key, false, game)
+-- ── KPS log ──────────────────────────────────
+local kpsLog = {}
+
+-- ═══════════════════════════════════════════════════════════════
+-- VIM INPUT
+-- ─────────────────────────────────────────────────────────────
+-- IMPORTANT: on Delta/Android, VIM:SendKeyEvent(true,...) while the
+-- key is already held-down has NO effect (no repeat).  We must
+-- always release before re-pressing the same key.
+-- We track `lanePressed` to avoid redundant calls.
+-- ═══════════════════════════════════════════════════════════════
+local function vimDown(lane)
+    if not lanePressed[lane] then
+        lanePressed[lane] = true
+        VIM:SendKeyEvent(true, v4.KeyBinds[lane], false, game)
     end
 end
 
-local function releaseHold(i)
-    if laneHoldFrame[i] then
-        laneHoldFrame[i] = nil
-        doRelease(v4.KeyBinds[i])
+local function vimUp(lane)
+    if lanePressed[lane] then
+        lanePressed[lane] = false
+        VIM:SendKeyEvent(false, v4.KeyBinds[lane], false, game)
     end
 end
+
+local function vimTap(lane)
+    -- Ensure key is up, then press, then release after TapDuration
+    vimUp(lane)
+    vimDown(lane)
+    task.delay(v4.TapDuration, function() vimUp(lane) end)
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- HOLD RELEASE WATCHER
+-- ─────────────────────────────────────────────────────────────
+-- From source (NoteInput line 1034-1039):
+--   When head is hit: v277.Parent = v256  (holdFrame → ArrowN.Hold.Hitbox)
+--   Heartbeat:        if keyHeld[lane]==false → hold broken
+--   Debris:           destroys holdFrame after holdDuration+4 sec
+--
+-- Correct sequence:
+--   1. Press VIM key (hold key down)
+--   2. Wait for holdFrame to appear in Hitbox (NoteInput reparents it)
+--   3. Connect Hitbox.ChildRemoved for that specific frame
+--   4. When ChildRemoved fires → release VIM key
+--   5. Heartbeat fallback: if frame leaves game tree → release
+-- ═══════════════════════════════════════════════════════════════
+local function stopHold(lane)
+    laneHoldFrame[lane] = nil
+    vimUp(lane)
+end
+
+local function watchHold(lane, arrowFrame, holdFrame)
+    laneHoldFrame[lane] = holdFrame
+
+    local hitbox = arrowFrame:FindFirstChild("Hold")
+               and arrowFrame.Hold:FindFirstChild("Hitbox")
+
+    local released = false
+    local function release()
+        if released then return end
+        released = true
+        if laneHoldFrame[lane] == holdFrame then
+            stopHold(lane)
+        end
+    end
+
+    task.spawn(function()
+        -- If no hitbox, fall back to pure IsDescendantOf polling
+        if not hitbox then
+            while laneHoldFrame[lane] == holdFrame do
+                RunService.Heartbeat:Wait()
+                if not holdFrame:IsDescendantOf(game) then
+                    release(); return
+                end
+            end
+            return
+        end
+
+        -- Poll until NoteInput moves holdFrame into Hitbox (usually 1 frame)
+        local deadline = tick() + 0.10
+        while tick() < deadline do
+            if laneHoldFrame[lane] ~= holdFrame then return end  -- superseded
+            if holdFrame:IsDescendantOf(hitbox) then
+                -- Frame is in Hitbox — now connect ChildRemoved
+                local conn
+                conn = hitbox.ChildRemoved:Connect(function(child)
+                    if child == holdFrame then
+                        conn:Disconnect()
+                        release()
+                    end
+                end)
+                -- Heartbeat fallback
+                task.spawn(function()
+                    while laneHoldFrame[lane] == holdFrame do
+                        RunService.Heartbeat:Wait()
+                        if not holdFrame:IsDescendantOf(game) then
+                            conn:Disconnect()
+                            release(); return
+                        end
+                    end
+                end)
+                return
+            end
+            if not holdFrame:IsDescendantOf(game) then
+                release(); return
+            end
+            RunService.Heartbeat:Wait()
+        end
+        -- Timeout: never arrived in hitbox — release to avoid stuck key
+        release()
+    end)
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- HELPERS
+-- ═══════════════════════════════════════════════════════════════
+local HIT_OFFSETS = { sick=0.045, good=0.075, ok=0.125, bad=0.175 }
 
 local function pickRating()
     local pool = {}
@@ -160,148 +265,6 @@ local function canPress()
     return true
 end
 
--- ── Hold release watcher ──────────────────────
--- SEQUENCE (from decompiled NoteInput, lines 1018-1033):
---   1. We detect note + grab holdFrame from Notes BEFORE pressing
---   2. We call pressKey → NoteInput fires synchronously → moves holdFrame to Hitbox
---   3. We poll until holdFrame:IsDescendantOf(hitbox) is true (up to 80ms)
---   4. ONLY THEN connect hitbox.ChildRemoved for our specific frame
---   5. Debris destroys holdFrame after holdDuration → ChildRemoved fires → release
---   6. Heartbeat fallback: release if holdFrame leaves game tree entirely
---
--- WHY previous approach was broken:
---   - watchHold was called BEFORE press, so ChildRemoved on Hitbox fired
---     when the frame was reparented INTO Hitbox (wrong trigger)
---   - AncestryChanged fires on every reparent, not just destruction
-local function watchHold(ai, arrowFrame, holdFrame)
-    laneHoldFrame[ai] = holdFrame
-    local hitbox = arrowFrame:FindFirstChild("Hold") and
-                   arrowFrame.Hold:FindFirstChild("Hitbox")
-
-    if not hitbox then
-        -- No hitbox found: pure heartbeat fallback
-        task.spawn(function()
-            while laneHoldFrame[ai] == holdFrame do
-                RunService.Heartbeat:Wait()
-                if not holdFrame:IsDescendantOf(game) then
-                    releaseHold(ai); return
-                end
-            end
-        end)
-        return
-    end
-
-    -- Poll until NoteInput has moved holdFrame into Hitbox (happens within 1-2 frames)
-    task.spawn(function()
-        local deadline = tick() + 0.08  -- 80ms max wait (~5 frames at 60fps)
-        while tick() < deadline do
-            if laneHoldFrame[ai] ~= holdFrame then return end  -- cancelled
-            if holdFrame:IsDescendantOf(hitbox) then
-                -- Frame is now in Hitbox. Connect ChildRemoved for THIS frame only.
-                local conn
-                conn = hitbox.ChildRemoved:Connect(function(child)
-                    if child == holdFrame then
-                        conn:Disconnect()
-                        releaseHold(ai)
-                    end
-                end)
-                -- Heartbeat fallback in case ChildRemoved misfires
-                task.spawn(function()
-                    while laneHoldFrame[ai] == holdFrame do
-                        RunService.Heartbeat:Wait()
-                        if not holdFrame:IsDescendantOf(game) then
-                            conn:Disconnect()
-                            releaseHold(ai); return
-                        end
-                    end
-                end)
-                return
-            end
-            if not holdFrame:IsDescendantOf(game) then
-                -- Already destroyed before we could watch (very short hold)
-                releaseHold(ai); return
-            end
-            RunService.Heartbeat:Wait()
-        end
-        -- Timeout: frame never arrived in Hitbox — release to avoid stuck key
-        if laneHoldFrame[ai] == holdFrame then
-            releaseHold(ai)
-        end
-    end)
-end
-
--- ── Note handler ──────────────────────────────
-local HIT_OFFSETS = { sick=0.045, good=0.075, ok=0.125, bad=0.175 }
-
-local function handleNote(ai, note, arrowFrame, isHold, holdFrame, sync)
-    local key = v4.KeyBinds[ai]
-
-    -- Release any active hold (new note coming in)
-    if laneHoldFrame[ai] then releaseHold(ai) end
-
-    -- Jack check for regular taps
-    if not isHold and laneHeld[ai] then
-        if missJacks then return end
-        if not sync then
-            task.spawn(function()
-                doRelease(key); task.wait(0.02)
-                doPress(key); task.wait(v4.TapDuration); doRelease(key)
-            end)
-        end
-        return
-    end
-
-    local function pressPath()
-        if not canPress() then
-            if not isHold then laneHeld[ai] = false end
-            return
-        end
-        doRelease(key)
-        if not sync then task.wait() end
-        doPress(key)
-        if isHold then
-            -- Watch for hold completion — release when Debris destroys holdFrame
-            watchHold(ai, arrowFrame, holdFrame)
-        else
-            laneHeld[ai] = true
-            task.delay(v4.TapDuration, function()
-                doRelease(key); laneHeld[ai] = false
-            end)
-        end
-    end
-
-    if sync then
-        local rating = pickRating()
-        if rating == "miss" then
-            if not isHold then laneHeld[ai] = false end
-            return
-        end
-        pressPath()
-    else
-        task.spawn(function()
-            local rating = pickRating()
-            if maxReaction > 0 then
-                local lo = math.min(minReaction, maxReaction)
-                local hi = math.max(minReaction, maxReaction)
-                task.wait((lo == hi and lo or math.random(lo,hi)) / 1000)
-            end
-            if rating ~= "perfect" then
-                local off = HIT_OFFSETS[rating]
-                if off then task.wait(off) end
-            end
-            if not canPress() then
-                if not isHold then laneHeld[ai] = false end
-                return
-            end
-            if rating == "miss" then
-                if not isHold then laneHeld[ai] = false end
-                return
-            end
-            pressPath()
-        end)
-    end
-end
-
 local function getMyKeySync()
     local M = v5.PlayerGui:FindFirstChild("Main")
         and v5.PlayerGui.Main:FindFirstChild("MatchFrame")
@@ -312,17 +275,62 @@ local function getMyKeySync()
     end
 end
 
--- ── Main loop ─────────────────────────────────
+-- ═══════════════════════════════════════════════════════════════
+-- NOTE HANDLER
+-- ═══════════════════════════════════════════════════════════════
+local function handleNote(lane, isHold, holdFrame, arrowFrame, sync)
+    if not canPress() then return end
+
+    local rating = pickRating()
+    if rating == "miss" then return end
+
+    -- For a hold: cancel any previous hold on this lane first
+    if laneHoldFrame[lane] then
+        stopHold(lane)
+    end
+
+    local function fire()
+        if isHold then
+            -- Press and HOLD — release is managed by watchHold
+            vimUp(lane)   -- ensure clean state
+            vimDown(lane)
+            watchHold(lane, arrowFrame, holdFrame)
+        else
+            -- Tap: press then release after TapDuration
+            vimTap(lane)
+        end
+    end
+
+    if sync then
+        -- Perfected mode: fire immediately, no yields
+        -- (we're already frame-aligned by RenderStepped)
+        fire()
+    else
+        -- Non-perfected: apply reaction delay + rating offset
+        task.spawn(function()
+            if maxReaction > 0 then
+                local lo = math.min(minReaction, maxReaction)
+                local hi = math.max(minReaction, maxReaction)
+                local delay = lo == hi and lo or math.random(lo, hi)
+                task.wait(delay / 1000)
+            end
+            if rating ~= "perfect" then
+                local off = HIT_OFFSETS[rating]
+                if off then task.wait(off) end
+            end
+            fire()
+        end)
+    end
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- MAIN LOOP
+-- ═══════════════════════════════════════════════════════════════
 local function startLoop()
     if mainLoop then mainLoop:Disconnect(); mainLoop = nil end
-
     seenNotes = {}
-    seenHolds = {}
-    local cacheBuilt = {}
 
-    -- pendingHold removed: hold frame is named "Hold_<noteName>" per decompiled
-    -- source (v100.Name = "Hold_" .. p90). We look it up directly by name when
-    -- we see a HoldHead note — no pre-registration or ordering dependency needed.
+    local cacheBuilt = {}
 
     local function tick_fn(sync)
         if not v8 then return end
@@ -331,54 +339,75 @@ local function startLoop()
 
         local spd = (_G and _G.Settings and _G.Settings.NoteSpeed) or 2
         spd = math.clamp(tonumber(spd) or 2, 0.8, 5)
-
-        -- Trigger window: fire VIM exactly vimLatencyMs before perfect edge
         local triggerScale = calcTriggerScale(spd)
 
-        for i = 1, 4 do
-            local f = KS:FindFirstChild("Arrow"..i)
-            local n = f and f:FindFirstChild("Notes")
-            if not (f and n) then continue end
+        for lane = 1, 4 do
+            local arrowFrame = KS:FindFirstChild("Arrow"..lane)
+            local notesFrame = arrowFrame and arrowFrame:FindFirstChild("Notes")
+            if not (arrowFrame and notesFrame) then continue end
 
-            if not cacheBuilt[i] then
-                cacheBuilt[i] = true
-                n.ChildAdded:Connect(function(c)
-                    c.AncestryChanged:Connect(function()
-                        if not c:IsDescendantOf(game) then
-                            seenNotes[c] = nil
-                            seenHolds[c] = nil
+            -- Cache cleanup: clear seenNotes when children leave the tree
+            if not cacheBuilt[lane] then
+                cacheBuilt[lane] = true
+                notesFrame.ChildAdded:Connect(function(child)
+                    child.AncestryChanged:Connect(function()
+                        if not child:IsDescendantOf(game) then
+                            seenNotes[child] = nil
                         end
                     end)
                 end)
             end
 
-            if laneHoldFrame[i] then continue end
+            -- Find the closest head note to scale=0 within the trigger window
+            -- A note is a head if: it has Type=="Note" attribute AND either:
+            --   (a) HoldHead attribute == true  (for holds)
+            --   (b) no "Hold_" prefix in name   (for taps)
+            -- We skip Hold_ frames explicitly.
+            local bestNote = nil
+            local bestDist = math.huge
 
-            for _, child in pairs(n:GetChildren()) do
+            for _, child in ipairs(notesFrame:GetChildren()) do
                 if not child:IsA("GuiObject") then continue end
-                -- Skip hold tail frames and the static Arrow object
-                if child.Name:sub(1,5) == "Hold_" then continue end
-                if child.Name == "Arrow" then continue end
-
-                local dist = math.abs(child.Position.Y.Scale)
-                if dist > triggerScale then continue end
+                if child.Name:sub(1,5) == "Hold_" then continue end  -- skip tail
                 if not child.Visible then continue end
                 if seenNotes[child] then continue end
 
-                seenNotes[child] = true
-
-                if laneHoldFrame[i] then releaseHold(i) end
-
-                -- Detect hold head and locate its tail frame directly by name
-                local isHold    = child:GetAttribute("HoldHead") == true
-                local holdFrame = isHold and n:FindFirstChild("Hold_" .. child.Name) or nil
-
-                handleNote(i, child, f, isHold, holdFrame, sync)
-
-                child.AncestryChanged:Once(function()
-                    seenNotes[child] = nil
-                end)
+                local dist = math.abs(child.Position.Y.Scale)
+                if dist <= triggerScale and dist < bestDist then
+                    bestDist = dist
+                    bestNote = child
+                end
             end
+
+            if not bestNote then continue end
+
+            -- Mark seen immediately so we don't double-fire
+            seenNotes[bestNote] = true
+
+            -- Determine if this is a hold head
+            local isHold    = bestNote:GetAttribute("HoldHead") == true
+            local holdFrame = nil
+            if isHold then
+                holdFrame = notesFrame:FindFirstChild("Hold_" .. bestNote.Name)
+                if not holdFrame then
+                    -- Hold frame missing — treat as regular tap to avoid stuck key
+                    isHold = false
+                end
+            end
+
+            -- If a hold is active on this lane and a new note arrives:
+            -- release the hold first (watchHold's release will fire too,
+            -- but stopHold is idempotent via the `released` flag)
+            if laneHoldFrame[lane] then
+                stopHold(lane)
+            end
+
+            handleNote(lane, isHold, holdFrame, arrowFrame, sync)
+
+            -- Clear seenNotes when the note leaves the tree
+            bestNote.AncestryChanged:Once(function()
+                seenNotes[bestNote] = nil
+            end)
         end
     end
 
@@ -389,7 +418,9 @@ local function startLoop()
     end
 end
 
--- ── Tabs ──────────────────────────────────────
+-- ═══════════════════════════════════════════════════════════════
+-- TABS
+-- ═══════════════════════════════════════════════════════════════
 local infoTab     = window:AddTab("InfoTab",     { Text = "Info"     })
 local mainTab     = window:AddTab("MainTab",     { Text = "Main"     })
 local miscTab     = window:AddTab("MiscTab",     { Text = "Misc"     })
@@ -437,17 +468,21 @@ apGroup:AddToggle("AutoPlayerEnabled", {
     Callback = function(val)
         v8 = val
         if v8 then
-            laneHeld      = {false,false,false,false}
             laneHoldFrame = {nil,nil,nil,nil}
-            for _, k in pairs(v4.KeyBinds) do doRelease(k) end
+            lanePressed   = {false,false,false,false}
+            for i = 1,4 do vimUp(i) end
+            seenNotes = {}
             startLoop()
             window:Notification({ Title = "AutoPlayer", Text = "Turned <font color='#5BC8F5'><b>ON</b></font>", Duration = 2 })
         else
-            for i = 1, 4 do releaseHold(i) end
-            for _, k in pairs(v4.KeyBinds) do doRelease(k) end
+            for i = 1, 4 do
+                if laneHoldFrame[i] then stopHold(i) end
+                vimUp(i)
+            end
             if mainLoop then mainLoop:Disconnect(); mainLoop = nil end
-            laneHeld      = {false,false,false,false}
             laneHoldFrame = {nil,nil,nil,nil}
+            lanePressed   = {false,false,false,false}
+            seenNotes = {}
             window:Notification({ Title = "AutoPlayer", Text = "Turned <font color='#F5A623'><b>OFF</b></font>", Duration = 2 })
         end
     end,
@@ -514,10 +549,13 @@ apGroup:AddToggle("Perfected", {
 })
 
 -- ── Player Settings ───────────────────────────
+playerGroup:AddLabel("LatencyLabel", {
+    Text = "<font color='#F5A623'><b>VIM Latency Tuning:</b></font>\nms counter <b>positive (+)</b> → raise slider\nms counter <b>negative (-)</b> → lower slider"
+})
 playerGroup:AddSlider("VimLatency", {
     Text    = "VIM Latency (ms)",
-    Min     = 0, Max = 80, Value = 22, Step = 1,
-    Tooltip = "VIM delivery compensation. Lower if ms counter shows +, raise if shows -.",
+    Min     = 0, Max = 200, Value = 80, Step = 1,
+    Tooltip = "Raise if ms counter shows +. Lower if ms counter shows -. Tune until ms≈0.",
     Callback = function(val) vimLatencyMs = math.floor(val) end,
 })
 playerGroup:AddSeparator("PlayerSep0", {})
