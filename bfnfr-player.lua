@@ -58,44 +58,90 @@ end)
 local RunService = game:GetService("RunService")
 local VIM        = game:GetService("VirtualInputManager")
 local Players    = game:GetService("Players")
+local v5         = Players.LocalPlayer
 
 -- ═══════════════════════════════════════════════════════════════
--- TIMING  (from decompiled source w0opsie_songPlay.lua)
+-- TIMING
 -- ───────────────────────────────────────────────────────────────
--- • Notes tween: Y.Scale = 11*spd → -(11*spd) over 4 seconds
---     => velocity = 5.5*spd  scale-units / second
--- • NoteInput accepts when: |scale| / (11*spd) <= 0.06525
---     => perfect window edge = 0.71775 * spd
--- • Formula: triggerScale = (0.71775 - latSec * 5.5) * spd
+-- Perfect window from NoteInput: |scale| <= 0.71775 * spd
+-- We fire VIM `vimLatencyMs` before the window edge.
+-- Formula: triggerScale = (0.71775 - latSec * 5.5) * spd
 --
--- AUTO-LATENCY:
---   Calibration point from testing: spd=2.4 → 103ms optimal.
---   Since VIM hardware latency is constant (device-level), the same
---   ms value is mathematically correct at all scroll speeds.
---   Auto mode locks to the calibrated value and ignores the slider.
---   If auto mode produces drift at a different speed, disable it
---   and tune the slider manually for that speed.
+-- FULLY AUTOMATIC LATENCY:
+--   The game's msIndic (MatchFrame.msIndic) shows the hit offset.
+--   We read it every ~30 frames and adjust vimLatencyMs automatically:
+--     reading > 0  (pressed too late)  → increase latency compensation
+--     reading < 0  (pressed too early) → decrease latency compensation
+--   This self-corrects in real time regardless of scroll speed.
+--   Calibration from testing: spd=2.4 → 103ms is a good starting point.
 -- ═══════════════════════════════════════════════════════════════
-local vimLatencyMs   = 103  -- your calibrated value
-local autoLatency    = true -- lock to calibrated value automatically
-local CALIB_LATENCY  = 103  -- known-good latency from user calibration (spd=2.4)
-
-local function getEffectiveLatency()
-    -- Auto mode: always use the calibrated value.
-    -- The formula is already speed-invariant (vimLatencyMs doesn't need
-    -- to change with scroll speed mathematically).
-    return autoLatency and CALIB_LATENCY or vimLatencyMs
-end
+local vimLatencyMs  = 103   -- starting value; auto-adjust will tune this
+local autoLatency   = true  -- continuously self-correct from ms counter
+local AUTO_RATE     = 0.25  -- how aggressively to correct (0=none, 1=full)
+local autoLatencyConn = nil -- Heartbeat connection for auto-latency
 
 local function calcTriggerScale(spd)
-    local latMs  = getEffectiveLatency()
-    local coeff  = 0.71775 - (latMs / 1000) * 5.5
+    local coeff = 0.71775 - (vimLatencyMs / 1000) * 5.5
     coeff = math.clamp(coeff, 0.05, 0.71775)
     return coeff * spd
 end
 
+-- ── Auto latency: read ms counter and self-correct ──────────────
+local autoSampleCount = 0
+local autoSampleSum   = 0
+local AUTO_SAMPLE_N   = 8    -- average over 8 readings before adjusting
+
+local function startAutoLatency()
+    if autoLatencyConn then autoLatencyConn:Disconnect() end
+    autoSampleCount = 0; autoSampleSum = 0
+    local frameCount = 0
+    autoLatencyConn = RunService.Heartbeat:Connect(function()
+        if not autoLatency then return end
+        frameCount = frameCount + 1
+        if frameCount < 30 then return end  -- sample every 30 frames (~0.5s)
+        frameCount = 0
+
+        -- Find the ms counter in the game UI
+        local mf = v5.PlayerGui:FindFirstChild("Main")
+               and v5.PlayerGui.Main:FindFirstChild("MatchFrame")
+        if not mf then return end
+        local msIndic = mf:FindFirstChild("msIndic")
+        if not msIndic then return end
+
+        local txt = msIndic.Text or ""
+        -- Text format: "±XX.XXms" — extract the number
+        local val = tonumber(txt:match("(-?%d+%.?%d*)"))
+        if not val then return end
+
+        -- Accumulate samples
+        autoSampleSum   = autoSampleSum + val
+        autoSampleCount = autoSampleCount + 1
+
+        if autoSampleCount < AUTO_SAMPLE_N then return end
+
+        -- Compute average and adjust
+        local avg = autoSampleSum / autoSampleCount
+        autoSampleSum   = 0
+        autoSampleCount = 0
+
+        -- avg > 0: pressing too late → need to fire earlier → increase latencyMs
+        -- avg < 0: pressing too early → need to fire later → decrease latencyMs
+        -- Only adjust if drift is > 2ms to avoid jitter on perfect timing
+        if math.abs(avg) > 2 then
+            vimLatencyMs = math.clamp(
+                vimLatencyMs + avg * AUTO_RATE,
+                0, 300
+            )
+        end
+    end)
+end
+
+local function stopAutoLatency()
+    if autoLatencyConn then autoLatencyConn:Disconnect(); autoLatencyConn = nil end
+end
+
 -- ═══════════════════════════════════════════════════════════════
--- KEYBINDS  (must match game's _G.Settings.Inputs)
+-- KEYBINDS
 -- ═══════════════════════════════════════════════════════════════
 local v4 = {
     KeyBinds    = {Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.W, Enum.KeyCode.D},
@@ -105,22 +151,17 @@ local v4 = {
 -- ═══════════════════════════════════════════════════════════════
 -- STATE
 -- ═══════════════════════════════════════════════════════════════
-local v5 = Players.LocalPlayer
-local v8 = false          -- autoplay enabled
-local missJacks  = false
-local legitMode  = false
-local perfected  = false
-local antiMiss   = false  -- widen window + catch any slipped note before miss
-local mainLoop   = nil
+local v8          = false
+local missJacks   = false
+local legitMode   = false
+local perfected   = false
+local antiMiss    = false
+local tileLights  = false   -- light up mobile tiles on keypress
+local mainLoop    = nil
 
--- Per-lane hold state
--- laneHoldFrame[i]: the Hold_ frame currently in Hitbox being held, or nil
 local laneHoldFrame = {nil, nil, nil, nil}
-
--- lanePressed[i]: true while VIM key is physically down (not yet released)
-local lanePressed = {false, false, false, false}
-
-local seenNotes = {}   -- [note] = true once dispatched
+local lanePressed   = {false, false, false, false}
+local seenNotes     = {}
 
 local minReaction   = 0
 local maxReaction   = 0
@@ -134,21 +175,45 @@ local missChance    = 0
 local platformContent    = "😇"
 local platformAutoRejoin = true
 
--- ── KPS log ──────────────────────────────────
 local kpsLog = {}
 
 -- ═══════════════════════════════════════════════════════════════
--- VIM INPUT
--- ─────────────────────────────────────────────────────────────
--- IMPORTANT: on Delta/Android, VIM:SendKeyEvent(true,...) while the
--- key is already held-down has NO effect (no repeat).  We must
--- always release before re-pressing the same key.
--- We track `lanePressed` to avoid redundant calls.
+-- TILE LIGHTING
+-- ───────────────────────────────────────────────────────────────
+-- The game uses v73 (arrow skin class) with :Hit(), :Tap(), :Release()
+-- to animate the receptor. We replicate the "lit" state by setting
+-- ArrowN.Arrow.ImageTransparency = 0 on press and 0.5 on release.
+-- This matches what the skin does internally on Hit().
+-- Path: MatchFrame > KeySyncN > ArrowN > Arrow (ImageLabel)
 -- ═══════════════════════════════════════════════════════════════
+local function getArrowImage(side, lane)
+    local mf = v5.PlayerGui:FindFirstChild("Main")
+           and v5.PlayerGui.Main:FindFirstChild("MatchFrame")
+    if not mf then return nil end
+    local ks = mf:FindFirstChild("KeySync"..side)
+    if not ks then return nil end
+    local ar = ks:FindFirstChild("Arrow"..lane)
+    if not ar then return nil end
+    return ar:FindFirstChild("Arrow")  -- the ImageLabel receptor
+end
+
+local function lightTile(side, lane, lit)
+    if not tileLights then return end
+    local img = getArrowImage(side, lane)
+    if not img then return end
+    img.ImageTransparency = lit and 0 or 0.5
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- VIM INPUT
+-- ═══════════════════════════════════════════════════════════════
+local currentSide = 1  -- updated by getMyKeySync result
+
 local function vimDown(lane)
     if not lanePressed[lane] then
         lanePressed[lane] = true
         VIM:SendKeyEvent(true, v4.KeyBinds[lane], false, game)
+        lightTile(currentSide, lane, true)
     end
 end
 
@@ -156,11 +221,11 @@ local function vimUp(lane)
     if lanePressed[lane] then
         lanePressed[lane] = false
         VIM:SendKeyEvent(false, v4.KeyBinds[lane], false, game)
+        lightTile(currentSide, lane, false)
     end
 end
 
 local function vimTap(lane)
-    -- Ensure key is up, then press, then release after TapDuration
     vimUp(lane)
     vimDown(lane)
     task.delay(v4.TapDuration, function() vimUp(lane) end)
@@ -168,22 +233,36 @@ end
 
 -- ═══════════════════════════════════════════════════════════════
 -- HOLD RELEASE WATCHER
--- ─────────────────────────────────────────────────────────────
--- From source (NoteInput line 1034-1039):
---   When head is hit: v277.Parent = v256  (holdFrame → ArrowN.Hold.Hitbox)
---   Heartbeat:        if keyHeld[lane]==false → hold broken
---   Debris:           destroys holdFrame after holdDuration+4 sec
+-- ───────────────────────────────────────────────────────────────
+-- Sequence (from decompiled NoteInput):
+--   1. vimDown(lane)
+--   2. NoteInput fires → v277.Parent = Hitbox
+--   3. Poll Hitbox until holdFrame arrives
+--   4. Connect Hitbox.ChildRemoved for that frame
+--   5. ChildRemoved → vimUp(lane)
+--   Fallback: Heartbeat polls IsDescendantOf(game)
 --
--- Correct sequence:
---   1. Press VIM key (hold key down)
---   2. Wait for holdFrame to appear in Hitbox (NoteInput reparents it)
---   3. Connect Hitbox.ChildRemoved for that specific frame
---   4. When ChildRemoved fires → release VIM key
---   5. Heartbeat fallback: if frame leaves game tree → release
+-- HOLD VISUAL FIX (consecutive holds on same lane):
+--   When a second hold arrives while the first is still in watchHold's
+--   poll loop, stopHold() sets laneHoldFrame[lane]=nil which causes
+--   the poll loop to bail (laneHoldFrame[lane] ~= holdFrame).
+--   The second hold then calls vimDown cleanly.
+--   Additionally we reset LnHold.ImageTransparency=1 on stopHold
+--   to clear the stuck "hold active" glow.
 -- ═══════════════════════════════════════════════════════════════
-local function stopHold(lane)
+local function resetLnHold(arrowFrame)
+    -- Reset the hold glow visual that the game sets to 0 on hold hit
+    pcall(function()
+        arrowFrame.LnHold.ImageTransparency = 1
+    end)
+end
+
+local function stopHold(lane, arrowFrame)
+    local prev = laneHoldFrame[lane]
     laneHoldFrame[lane] = nil
     vimUp(lane)
+    -- Clear hold glow if we have the arrowFrame reference
+    if arrowFrame then resetLnHold(arrowFrame) end
 end
 
 local function watchHold(lane, arrowFrame, holdFrame)
@@ -197,12 +276,11 @@ local function watchHold(lane, arrowFrame, holdFrame)
         if released then return end
         released = true
         if laneHoldFrame[lane] == holdFrame then
-            stopHold(lane)
+            stopHold(lane, arrowFrame)
         end
     end
 
     task.spawn(function()
-        -- If no hitbox, fall back to pure IsDescendantOf polling
         if not hitbox then
             while laneHoldFrame[lane] == holdFrame do
                 RunService.Heartbeat:Wait()
@@ -213,12 +291,10 @@ local function watchHold(lane, arrowFrame, holdFrame)
             return
         end
 
-        -- Poll until NoteInput moves holdFrame into Hitbox (usually 1 frame)
         local deadline = tick() + 0.10
         while tick() < deadline do
-            if laneHoldFrame[lane] ~= holdFrame then return end  -- superseded
+            if laneHoldFrame[lane] ~= holdFrame then return end
             if holdFrame:IsDescendantOf(hitbox) then
-                -- Frame is in Hitbox — now connect ChildRemoved
                 local conn
                 conn = hitbox.ChildRemoved:Connect(function(child)
                     if child == holdFrame then
@@ -226,7 +302,6 @@ local function watchHold(lane, arrowFrame, holdFrame)
                         release()
                     end
                 end)
-                -- Heartbeat fallback
                 task.spawn(function()
                     while laneHoldFrame[lane] == holdFrame do
                         RunService.Heartbeat:Wait()
@@ -243,7 +318,6 @@ local function watchHold(lane, arrowFrame, holdFrame)
             end
             RunService.Heartbeat:Wait()
         end
-        -- Timeout: never arrived in hitbox — release to avoid stuck key
         release()
     end)
 end
@@ -283,7 +357,9 @@ local function getMyKeySync()
     if not (M and M.Visible) then return nil end
     local pv = v5:FindFirstChild("File") and v5.File:FindFirstChild("CurrentPlayer")
     if pv and pv.Value then
-        return M:FindFirstChild(pv.Value.Name == "Player2" and "KeySync2" or "KeySync1")
+        local side = pv.Value.Name == "Player2" and 2 or 1
+        currentSide = side
+        return M:FindFirstChild("KeySync"..side), side
     end
 end
 
@@ -296,29 +372,23 @@ local function handleNote(lane, isHold, holdFrame, arrowFrame, sync)
     local rating = pickRating()
     if rating == "miss" then return end
 
-    -- For a hold: cancel any previous hold on this lane first
     if laneHoldFrame[lane] then
-        stopHold(lane)
+        stopHold(lane, arrowFrame)
     end
 
     local function fire()
         if isHold then
-            -- Press and HOLD — release is managed by watchHold
-            vimUp(lane)   -- ensure clean state
+            vimUp(lane)
             vimDown(lane)
             watchHold(lane, arrowFrame, holdFrame)
         else
-            -- Tap: press then release after TapDuration
             vimTap(lane)
         end
     end
 
     if sync then
-        -- Perfected mode: fire immediately, no yields
-        -- (we're already frame-aligned by RenderStepped)
         fire()
     else
-        -- Non-perfected: apply reaction delay + rating offset
         task.spawn(function()
             if maxReaction > 0 then
                 local lo = math.min(minReaction, maxReaction)
@@ -353,17 +423,20 @@ local function startLoop()
         spd = math.clamp(tonumber(spd) or 2, 0.8, 5)
         local triggerScale = calcTriggerScale(spd)
 
-        -- Anti Miss: also catch notes up to the outer NoteInput detect window
-        -- (2.4*spd, clamped 1-9) so nothing slips past before we see it.
-        -- We still fire at the normal trigger point; this just widens the scan.
-        local antiMissWindow = antiMiss and math.clamp(2.4 * spd, 1, 9) or triggerScale
+        -- Anti Miss: scan wide (full outer detect window) but ONLY FIRE
+        -- when the note is within triggerScale. Notes detected in the wider
+        -- window are queued in seenNotes so they are not re-detected, and
+        -- they get fired as soon as they enter triggerScale on a subsequent frame.
+        -- This prevents the "fires too early" problem of the old approach.
+        local scanWindow = antiMiss
+            and math.clamp(2.4 * spd, 1, 9)
+            or  triggerScale
 
         for lane = 1, 4 do
             local arrowFrame = KS:FindFirstChild("Arrow"..lane)
             local notesFrame = arrowFrame and arrowFrame:FindFirstChild("Notes")
             if not (arrowFrame and notesFrame) then continue end
 
-            -- Cache cleanup: clear seenNotes when children leave the tree
             if not cacheBuilt[lane] then
                 cacheBuilt[lane] = true
                 notesFrame.ChildAdded:Connect(function(child)
@@ -375,22 +448,13 @@ local function startLoop()
                 end)
             end
 
-            -- Find the closest head note to scale=0 within the trigger window
-            -- A note is a head if: it has Type=="Note" attribute AND either:
-            --   (a) HoldHead attribute == true  (for holds)
-            --   (b) no "Hold_" prefix in name   (for taps)
-            -- We skip Hold_ frames explicitly.
+            -- Find closest unhandled note within the scan window
             local bestNote = nil
             local bestDist = math.huge
 
-            -- Anti Miss scans the full outer window (2.4*spd) so any note
-            -- that has slipped past the trigger point is still caught and fired.
-            -- Normal mode only scans within the calibrated trigger window.
-            local scanWindow = antiMiss and antiMissWindow or triggerScale
-
             for _, child in ipairs(notesFrame:GetChildren()) do
                 if not child:IsA("GuiObject") then continue end
-                if child.Name:sub(1,5) == "Hold_" then continue end  -- skip tail
+                if child.Name:sub(1,5) == "Hold_" then continue end
                 if not child.Visible then continue end
                 if seenNotes[child] then continue end
 
@@ -403,30 +467,28 @@ local function startLoop()
 
             if not bestNote then continue end
 
-            -- Mark seen immediately so we don't double-fire
+            -- Anti Miss: only fire when within the calibrated trigger window.
+            -- If outside triggerScale but inside scanWindow: we've "seen" the
+            -- note but don't fire yet — wait for it to reach trigger distance.
+            -- We do NOT mark seenNotes yet so it stays eligible next frame.
+            if bestDist > triggerScale then continue end
+
+            -- Within trigger window — fire now
             seenNotes[bestNote] = true
 
-            -- Determine if this is a hold head
             local isHold    = bestNote:GetAttribute("HoldHead") == true
             local holdFrame = nil
             if isHold then
                 holdFrame = notesFrame:FindFirstChild("Hold_" .. bestNote.Name)
-                if not holdFrame then
-                    -- Hold frame missing — treat as regular tap to avoid stuck key
-                    isHold = false
-                end
+                if not holdFrame then isHold = false end
             end
 
-            -- If a hold is active on this lane and a new note arrives:
-            -- release the hold first (watchHold's release will fire too,
-            -- but stopHold is idempotent via the `released` flag)
             if laneHoldFrame[lane] then
-                stopHold(lane)
+                stopHold(lane, arrowFrame)
             end
 
             handleNote(lane, isHold, holdFrame, arrowFrame, sync)
 
-            -- Clear seenNotes when the note leaves the tree
             bestNote.AncestryChanged:Once(function()
                 seenNotes[bestNote] = nil
             end)
@@ -448,8 +510,8 @@ local mainTab     = window:AddTab("MainTab",     { Text = "Main"     })
 local miscTab     = window:AddTab("MiscTab",     { Text = "Misc"     })
 local settingsTab = window:AddTab("SettingsTab", { Text = "Settings" })
 
--- ── Info tab ──────────────────────────────────
-local infoLeft  = infoTab:AddLeftGroupbox("InfoLeft",  { Text = "Welcome" })
+-- ── Info ──────────────────────────────────────
+local infoLeft  = infoTab:AddLeftGroupbox("InfoLeft",  { Text = "Welcome"      })
 local infoRight = infoTab:AddRightGroupbox("InfoRight", { Text = "How It Works" })
 
 infoLeft:AddLabel("InfoL1", {
@@ -457,7 +519,7 @@ infoLeft:AddLabel("InfoL1", {
 })
 infoLeft:AddSeparator("InfoSep1", {})
 infoLeft:AddLabel("InfoL2", {
-    Text = "<font color='#F5A623'><b>Best settings for all Perfects:</b></font>\n• Perfected: <b>ON</b>\n• Min/Max Reaction: <b>0ms</b>\n• Perfect weight: <b>100</b>, rest <b>0</b>\n• Works at <b>any scroll speed</b>"
+    Text = "<font color='#F5A623'><b>Best settings for all Perfects:</b></font>\n• Perfected: <b>ON</b>\n• Auto Latency: <b>ON</b>\n• Anti Miss: <b>ON</b>\n• Perfect weight: <b>100</b>, rest <b>0</b>"
 })
 infoLeft:AddSeparator("InfoSep2", {})
 infoLeft:AddLabel("InfoL3", {
@@ -467,14 +529,12 @@ infoLeft:AddLabel("InfoL3", {
 infoRight:AddLabel("InfoR1", { Text = "<font color='#F5A623'><b>Feature Guide</b></font>" })
 infoRight:AddSeparator("InfoSepR1", {})
 infoRight:AddLabel("InfoR2", { Text = "<font color='#5BC8F5'><b>Enable</b></font>\nTurns the auto player on/off." })
-infoRight:AddLabel("InfoR3", { Text = "<font color='#5BC8F5'><b>Input</b></font>\nUses VirtualInputManager — confirmed working." })
-infoRight:AddLabel("InfoR4", { Text = "<font color='#5BC8F5'><b>Miss Jack Notes</b></font>\nSkips rapid same-key notes." })
-infoRight:AddLabel("InfoR5", { Text = "<font color='#5BC8F5'><b>Legit Mode</b></font>\nCaps KPS and biases toward Sick/Good." })
-infoRight:AddLabel("InfoR6", { Text = "<font color='#5BC8F5'><b>Perfected</b></font>\nRenderStepped + zero-yield press.\nDetects by Position.Y.Scale (same as game).\nAutomatically calibrated to scroll speed.\nHolds release via Hitbox.ChildRemoved." })
-infoRight:AddLabel("InfoR6b", { Text = "<font color='#5BC8F5'><b>Anti Miss</b></font>\nWidens scan to full outer detect window.\nCatches any note that slips past the\nnormal trigger point. Toggle ON for\ndense/fast songs where notes get skipped." })
-infoRight:AddLabel("InfoR6c", { Text = "<font color='#5BC8F5'><b>Auto Latency</b></font>\nLocks to your calibrated 103ms value.\nWorks correctly at any scroll speed\n(latency is device-level, speed-invariant).\nDisable to tune manually with the slider." })
+infoRight:AddLabel("InfoR3", { Text = "<font color='#5BC8F5'><b>Perfected</b></font>\nRenderStepped + zero-yield.\nBest timing accuracy." })
+infoRight:AddLabel("InfoR4", { Text = "<font color='#5BC8F5'><b>Anti Miss</b></font>\nScans wide but only fires at the\ncalibrated trigger point.\nCatches notes even during holds\nor lag spikes. Safe to leave ON." })
+infoRight:AddLabel("InfoR5", { Text = "<font color='#5BC8F5'><b>Auto Latency</b></font>\nReads the ms counter every ~4s\nand self-adjusts timing.\nStarts at 103ms, self-corrects\nto any scroll speed automatically." })
+infoRight:AddLabel("InfoR6", { Text = "<font color='#5BC8F5'><b>Tile Lights</b></font>\nLights up mobile receptors when\na key is pressed/held.\nCosmetic only, no impact on gameplay." })
 infoRight:AddLabel("InfoR7", {
-    Text = "<font color='#5BC8F5'><b>Hit Chances</b></font>\nWeights not percentages.\nAll 0 → always Perfect.\n\n<font color='#F5A623'><b>Windows:</b></font>\nPerfect: immediate\nSick: +45ms\nGood: +75ms\nOk: +125ms\nBad: +175ms"
+    Text = "<font color='#5BC8F5'><b>Hit Chances</b></font>\nWeights not percentages.\nAll 0 → always Perfect.\n\n<font color='#F5A623'><b>Windows:</b></font>\nPerfect: immediate\nSick: +45ms / Good: +75ms\nOk: +125ms / Bad: +175ms"
 })
 
 -- ── Groupboxes ────────────────────────────────
@@ -497,13 +557,15 @@ apGroup:AddToggle("AutoPlayerEnabled", {
             for i = 1,4 do vimUp(i) end
             seenNotes = {}
             startLoop()
+            if autoLatency then startAutoLatency() end
             window:Notification({ Title = "AutoPlayer", Text = "Turned <font color='#5BC8F5'><b>ON</b></font>", Duration = 2 })
         else
             for i = 1, 4 do
-                if laneHoldFrame[i] then stopHold(i) end
+                if laneHoldFrame[i] then stopHold(i, nil) end
                 vimUp(i)
             end
             if mainLoop then mainLoop:Disconnect(); mainLoop = nil end
+            stopAutoLatency()
             laneHoldFrame = {nil,nil,nil,nil}
             lanePressed   = {false,false,false,false}
             seenNotes = {}
@@ -514,14 +576,74 @@ apGroup:AddToggle("AutoPlayerEnabled", {
 
 apGroup:AddSeparator("APSep1", {})
 
-apGroup:AddToggle("MissJacks", {
-    Text    = "Miss Jack Notes",
+apGroup:AddToggle("Perfected", {
+    Text    = "Perfected",
     Value   = false,
-    Tooltip = "Skips rapid same-key notes",
-    Callback = function(val) missJacks = val end,
+    Tooltip = "RenderStepped + zero-yield. Best for perfect timing.",
+    Callback = function(val)
+        perfected = val
+        if val then minReaction = 0; maxReaction = 0 end
+        if v8 then
+            if mainLoop then mainLoop:Disconnect(); mainLoop = nil end
+            startLoop()
+        end
+        window:Notification({
+            Title = "Perfected",
+            Text  = val and "<font color='#5BC8F5'>ON</font>" or "<font color='#F5A623'>OFF</font>",
+            Duration = 2
+        })
+    end,
 })
 
 apGroup:AddSeparator("APSep2", {})
+
+apGroup:AddToggle("AntiMiss", {
+    Text    = "Anti Miss",
+    Value   = false,
+    Tooltip = "Scans notes early but only fires at the correct trigger point. Prevents skipped notes on dense/fast patterns.",
+    Callback = function(val)
+        antiMiss = val
+        window:Notification({
+            Title = "Anti Miss",
+            Text  = val and "<font color='#5BC8F5'>ON</font>" or "<font color='#F5A623'>OFF</font>",
+            Duration = 2
+        })
+    end,
+})
+
+apGroup:AddSeparator("APSep3", {})
+
+apGroup:AddToggle("TileLights", {
+    Text    = "Tile Lights",
+    Value   = false,
+    Tooltip = "Lights up mobile receptor tiles on keypress/hold. Cosmetic only.",
+    Callback = function(val)
+        tileLights = val
+        -- Reset all tiles when toggling off
+        if not val then
+            for lane = 1, 4 do
+                local img = getArrowImage(currentSide, lane)
+                if img then img.ImageTransparency = 0.5 end
+            end
+        end
+        window:Notification({
+            Title = "Tile Lights",
+            Text  = val and "<font color='#5BC8F5'>ON</font>" or "<font color='#F5A623'>OFF</font>",
+            Duration = 2
+        })
+    end,
+})
+
+apGroup:AddSeparator("APSep4", {})
+
+apGroup:AddToggle("MissJacks", {
+    Text    = "Miss Jack Notes",
+    Value   = false,
+    Tooltip = "Skips rapid same-key notes to look more human",
+    Callback = function(val) missJacks = val end,
+})
+
+apGroup:AddSeparator("APSep5", {})
 
 apGroup:AddToggle("LegitMode", {
     Text    = "Legit Mode",
@@ -551,67 +673,35 @@ apGroup:AddSlider("LegitKpsLimit", {
     Callback = function(val) legitKpsLimit = val end,
 })
 
-apGroup:AddSeparator("APSep3", {})
-
-apGroup:AddToggle("Perfected", {
-    Text    = "Perfected",
-    Value   = false,
-    Tooltip = "RenderStepped + zero-yield. Auto-calibrates to scroll speed.",
-    Callback = function(val)
-        perfected = val
-        if val then minReaction = 0; maxReaction = 0 end
-        if v8 then
-            if mainLoop then mainLoop:Disconnect(); mainLoop = nil end
-            startLoop()
-        end
-        window:Notification({
-            Title = "Perfected",
-            Text  = val and "<font color='#5BC8F5'>ON</font>" or "<font color='#F5A623'>OFF</font>",
-            Duration = 2
-        })
-    end,
-})
-
-apGroup:AddSeparator("APSep4", {})
-
-apGroup:AddToggle("AntiMiss", {
-    Text    = "Anti Miss",
-    Value   = false,
-    Tooltip = "Widens note scan to the full outer detect window so no note is ever skipped, even on dense/fast patterns.",
-    Callback = function(val)
-        antiMiss = val
-        window:Notification({
-            Title = "Anti Miss",
-            Text  = val and "<font color='#5BC8F5'>ON</font> — scanning full outer window"
-                        or "<font color='#F5A623'>OFF</font>",
-            Duration = 2
-        })
-    end,
-})
 -- ── Player Settings ───────────────────────────
 playerGroup:AddToggle("AutoLatency", {
     Text    = "Auto Latency",
     Value   = true,
-    Tooltip = "Automatically uses your calibrated latency (103ms) at any scroll speed. Disable to tune manually.",
+    Tooltip = "Reads the ms counter every ~4s and auto-adjusts timing. Starts at 103ms and self-corrects continuously.",
     Callback = function(val)
         autoLatency = val
+        if val and v8 then
+            startAutoLatency()
+        elseif not val then
+            stopAutoLatency()
+        end
         window:Notification({
             Title = "Auto Latency",
             Text  = val
-                and "<font color='#5BC8F5'>ON</font> — using calibrated <b>103ms</b>"
-                or  "<font color='#F5A623'>OFF</font> — use slider below to tune",
+                and "<font color='#5BC8F5'>ON</font> — self-correcting from ms counter"
+                or  "<font color='#F5A623'>OFF</font> — using manual slider",
             Duration = 3
         })
     end,
 })
 playerGroup:AddLabel("LatencyLabel", {
-    Text = "<font color='#888'>Manual tuning (Auto Latency OFF):</font>\nms counter <b>+</b> → raise slider\nms counter <b>-</b> → lower slider"
+    Text = "<font color='#888'>Manual: disable Auto Latency first.\nms counter + → raise  /  - → lower</font>"
 })
 playerGroup:AddSlider("VimLatency", {
     Text    = "VIM Latency (ms)",
-    Min     = 0, Max = 200, Value = 103, Step = 1,
-    Tooltip = "Only used when Auto Latency is OFF. Raise if ms counter shows +. Lower if shows -.",
-    Callback = function(val) vimLatencyMs = math.floor(val) end,
+    Min     = 0, Max = 300, Value = 103, Step = 1,
+    Tooltip = "Only active when Auto Latency is OFF.",
+    Callback = function(val) if not autoLatency then vimLatencyMs = math.floor(val) end end,
 })
 playerGroup:AddSeparator("PlayerSep0", {})
 playerGroup:AddSlider("MinReaction", {
@@ -661,7 +751,7 @@ chanceGroup:AddSlider("MissChance", {
     Callback = function(val) if not legitMode then missChance = math.floor(val) end end,
 })
 
--- ── Misc tab ──────────────────────────────────
+-- ── Misc ──────────────────────────────────────
 miscGroup:AddToggle("PlatformAutoRejoin", {
     Text     = "Custom Platform Display",
     Value    = true,
@@ -745,7 +835,7 @@ miscGroup:AddButton("ApplyPlatform", {
     end,
 })
 
--- ── Settings tab ──────────────────────────────
+-- ── Settings ──────────────────────────────────
 themeGroup:AddLabel("ThemeLbl1", {
     Text = "<font color='#5BC8F5'><b>Accent</b></font> (default: sky blue #5BC8F5)"
 }):AddColorPicker("ThemeMain", {
@@ -755,7 +845,6 @@ themeGroup:AddLabel("ThemeLbl1", {
         window:Refresh()
     end,
 })
-
 themeGroup:AddLabel("ThemeLbl2", {
     Text = "<font color='#F5A623'><b>Stroke</b></font> (default: gold #F5A623)"
 }):AddColorPicker("ThemeStroke", {
