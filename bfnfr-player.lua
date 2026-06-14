@@ -326,50 +326,30 @@ local function stopHold(lane, interrupted)
     if interrupted then resetLnHold(lane) end
 end
 
-local function watchHold(lane, arrowFrame, holdFrame)
+-- ═══════════════════════════════════════════════════════════════
+-- HOLD TIMER
+-- ───────────────────────────────────────────────────────────────
+-- Duration is encoded in the tail frame's Size.Y.Scale:
+--   Scale = v98 * 5.5 * spd  where v98 = duration - 0.07
+--   => duration = (Scale / (5.5 * spd)) + 0.07
+-- We hold the key for exactly that duration then release.
+-- A small safety buffer (+0.05s) is added so the release fires
+-- slightly after the hold ends rather than slightly before.
+-- If a new note arrives on the same lane before the timer ends,
+-- stopHold(lane, true) cancels laneHoldFrame[lane] so the
+-- task.delay release becomes a no-op.
+-- ═══════════════════════════════════════════════════════════════
+local function holdForDuration(lane, holdFrame, spd)
     laneHoldFrame[lane] = holdFrame
 
-    local hitbox = arrowFrame:FindFirstChild("Hold")
-               and arrowFrame.Hold:FindFirstChild("Hitbox")
+    local tailScale  = holdFrame.Size.Y.Scale
+    local duration   = (tailScale / (5.5 * spd)) + 0.07 + 0.05  -- +50ms buffer
 
-    local released = false
-    local function release()
-        if released then return end
-        released = true
-        -- Natural completion — don't reset LnHold, game handles it
-        if laneHoldFrame[lane] == holdFrame then stopHold(lane, false) end
-    end
-
-    task.spawn(function()
-        if not hitbox then
-            while laneHoldFrame[lane] == holdFrame do
-                RunService.Heartbeat:Wait()
-                if not holdFrame:IsDescendantOf(game) then release(); return end
-            end
-            return
+    task.delay(duration, function()
+        -- Only release if this hold is still the active one
+        if laneHoldFrame[lane] == holdFrame then
+            stopHold(lane, false)
         end
-        local deadline = tick() + 0.10
-        while tick() < deadline do
-            if laneHoldFrame[lane] ~= holdFrame then return end
-            if holdFrame:IsDescendantOf(hitbox) then
-                local conn
-                conn = hitbox.ChildRemoved:Connect(function(child)
-                    if child == holdFrame then conn:Disconnect(); release() end
-                end)
-                task.spawn(function()
-                    while laneHoldFrame[lane] == holdFrame do
-                        RunService.Heartbeat:Wait()
-                        if not holdFrame:IsDescendantOf(game) then
-                            conn:Disconnect(); release(); return
-                        end
-                    end
-                end)
-                return
-            end
-            if not holdFrame:IsDescendantOf(game) then release(); return end
-            RunService.Heartbeat:Wait()
-        end
-        release()
     end)
 end
 
@@ -416,7 +396,7 @@ end
 -- ═══════════════════════════════════════════════════════════════
 -- NOTE HANDLER
 -- ═══════════════════════════════════════════════════════════════
-local function handleNote(lane, isHold, holdFrame, arrowFrame, sync)
+local function handleNote(lane, isHold, holdFrame, arrowFrame, sync, spd)
     if not canPress() then return end
     local rating = pickRating()
     if rating == "miss" then return end
@@ -424,20 +404,14 @@ local function handleNote(lane, isHold, holdFrame, arrowFrame, sync)
 
     local function fire()
         if isHold then
-            -- SHORT HOLD DETECTION (from CreateNote source):
-            -- v98 = max(0, duration - 0.07); if v98 <= 0.03 → v98 = 0
-            -- holdFrame.Size.Y.Scale = v98 * 5.5 * spd
-            -- Result: any hold with duration <= 0.10s has scale = EXACTLY 0.0
-            --         any real hold (duration > 0.10s) has scale >= 0.88
-            -- There is a hard cliff with no overlap, so threshold of 0.01 is safe
-            -- at ALL scroll speeds.
+            -- SHORT HOLD: Scale = exactly 0.0 for duration <= 0.10s (source math).
+            -- Real holds have scale >= 0.88 at any scroll speed.
             local tailScale = holdFrame and holdFrame.Size.Y.Scale or 0
             if tailScale < 0.01 then
-                -- Short hold: tap instead of hold
                 vimTap(lane)
             else
                 vimUp(lane); vimDown(lane)
-                watchHold(lane, arrowFrame, holdFrame)
+                holdForDuration(lane, holdFrame, spd)
             end
         else
             vimTap(lane)
@@ -515,7 +489,7 @@ local function startLoop()
             if isHold and not holdFrame then isHold = false end
 
             if laneHoldFrame[lane] then stopHold(lane, true) end
-            handleNote(lane, isHold, holdFrame, arrowFrame, sync)
+            handleNote(lane, isHold, holdFrame, arrowFrame, sync, spd)
 
             bestNote.AncestryChanged:Once(function()
                 seenNotes[bestNote] = nil
