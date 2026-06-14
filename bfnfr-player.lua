@@ -418,8 +418,19 @@ local function handleNote(lane, isHold, holdFrame, arrowFrame, sync)
 
     local function fire()
         if isHold then
-            vimUp(lane); vimDown(lane)
-            watchHold(lane, arrowFrame, holdFrame)
+            -- SHORT HOLD DETECTION (from CreateNote source):
+            -- holdFrame.Size.Y.Scale = (duration - 0.07) * 5.5 * spd
+            -- "Blue notes" are charters using holds with near-zero duration.
+            -- Their tail scale is tiny (< 0.15). Treat these as taps — holding
+            -- them causes the key to stay down and block subsequent notes.
+            local tailScale = holdFrame and holdFrame.Size.Y.Scale or 0
+            if tailScale < 0.15 then
+                -- Short hold: tap instead of hold
+                vimTap(lane)
+            else
+                vimUp(lane); vimDown(lane)
+                watchHold(lane, arrowFrame, holdFrame)
+            end
         else
             vimTap(lane)
         end
