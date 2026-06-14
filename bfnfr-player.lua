@@ -315,10 +315,15 @@ local function resetLnHold(lane)
     end)
 end
 
-local function stopHold(lane)
+local function stopHold(lane, interrupted)
     laneHoldFrame[lane] = nil
     vimUp(lane)
-    resetLnHold(lane)
+    -- Only reset LnHold on early interruption (new note on same lane).
+    -- On natural hold completion, the game's own coroutine (source line 385)
+    -- resets LnHold.ImageTransparency = 1 after wait(holdDuration).
+    -- Resetting it here on natural end fights that coroutine and causes
+    -- the stuck visual.
+    if interrupted then resetLnHold(lane) end
 end
 
 local function watchHold(lane, arrowFrame, holdFrame)
@@ -331,7 +336,8 @@ local function watchHold(lane, arrowFrame, holdFrame)
     local function release()
         if released then return end
         released = true
-        if laneHoldFrame[lane] == holdFrame then stopHold(lane) end
+        -- Natural completion — don't reset LnHold, game handles it
+        if laneHoldFrame[lane] == holdFrame then stopHold(lane, false) end
     end
 
     task.spawn(function()
@@ -414,17 +420,19 @@ local function handleNote(lane, isHold, holdFrame, arrowFrame, sync)
     if not canPress() then return end
     local rating = pickRating()
     if rating == "miss" then return end
-    if laneHoldFrame[lane] then stopHold(lane) end
+    if laneHoldFrame[lane] then stopHold(lane, true) end
 
     local function fire()
         if isHold then
             -- SHORT HOLD DETECTION (from CreateNote source):
-            -- holdFrame.Size.Y.Scale = (duration - 0.07) * 5.5 * spd
-            -- "Blue notes" are charters using holds with near-zero duration.
-            -- Their tail scale is tiny (< 0.15). Treat these as taps — holding
-            -- them causes the key to stay down and block subsequent notes.
+            -- v98 = max(0, duration - 0.07); if v98 <= 0.03 → v98 = 0
+            -- holdFrame.Size.Y.Scale = v98 * 5.5 * spd
+            -- Result: any hold with duration <= 0.10s has scale = EXACTLY 0.0
+            --         any real hold (duration > 0.10s) has scale >= 0.88
+            -- There is a hard cliff with no overlap, so threshold of 0.01 is safe
+            -- at ALL scroll speeds.
             local tailScale = holdFrame and holdFrame.Size.Y.Scale or 0
-            if tailScale < 0.15 then
+            if tailScale < 0.01 then
                 -- Short hold: tap instead of hold
                 vimTap(lane)
             else
@@ -506,7 +514,7 @@ local function startLoop()
             local holdFrame = isHold and notesFrame:FindFirstChild("Hold_"..bestNote.Name) or nil
             if isHold and not holdFrame then isHold = false end
 
-            if laneHoldFrame[lane] then stopHold(lane) end
+            if laneHoldFrame[lane] then stopHold(lane, true) end
             handleNote(lane, isHold, holdFrame, arrowFrame, sync)
 
             bestNote.AncestryChanged:Once(function()
@@ -574,7 +582,7 @@ apGroup:AddToggle("AutoPlayerEnabled", {
             window:Notification({Title="AutoPlayer", Text="Turned <font color='#5BC8F5'><b>ON</b></font>", Duration=2})
         else
             for i=1,4 do
-                if laneHoldFrame[i] then stopHold(i) end
+                if laneHoldFrame[i] then stopHold(i, false) end
                 vimUp(i)
             end
             if mainLoop then mainLoop:Disconnect(); mainLoop=nil end
