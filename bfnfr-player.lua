@@ -342,11 +342,13 @@ end
 local function holdForDuration(lane, holdFrame, spd)
     laneHoldFrame[lane] = holdFrame
 
-    local tailScale  = holdFrame.Size.Y.Scale
+    -- CreateNote  (downscroll): Size.Y.Scale = +(v98 * 5.5 * spd)  positive
+    -- CreateNote2 (upscroll):   Size.Y.Scale = -(v98 * 5.5 * spd)  negative
+    -- Must use math.abs to handle both directions.
+    local tailScale  = math.abs(holdFrame.Size.Y.Scale)
     local duration   = (tailScale / (5.5 * spd)) + 0.07 + 0.05  -- +50ms buffer
 
     task.delay(duration, function()
-        -- Only release if this hold is still the active one
         if laneHoldFrame[lane] == holdFrame then
             stopHold(lane, false)
         end
@@ -405,8 +407,9 @@ local function handleNote(lane, isHold, holdFrame, arrowFrame, sync, spd)
     local function fire()
         if isHold then
             -- SHORT HOLD: Scale = exactly 0.0 for duration <= 0.10s (source math).
-            -- Real holds have scale >= 0.88 at any scroll speed.
-            local tailScale = holdFrame and holdFrame.Size.Y.Scale or 0
+            -- Real holds have |scale| >= 0.88 at any scroll speed.
+            -- Upscroll (CreateNote2) uses negative scale — must use math.abs.
+            local tailScale = holdFrame and math.abs(holdFrame.Size.Y.Scale) or 0
             if tailScale < 0.01 then
                 vimTap(lane)
             else
