@@ -61,30 +61,35 @@ local v5           = Players.LocalPlayer
 -- formula: trigger = (0.71775 - latency_in_seconds * 5.5) * spd
 --
 -- auto latency reads the ms counter and self-corrects:
---   hunt  → fast samples every 0.3s, corrects aggressively
---   locked → slow samples every 1s, tiny corrections
---   frozen → perfect, locked in, only re-hunts if it drifts
+--   hunt   → fast samples every 0.3s, corrects aggressively
+--   locked → slow samples every 1s, tiny corrections (never fully stops)
+--   resets to hunt on every new song so scroll speed changes are handled
 -- ════════════════════════════════════════════
 local vimLatencyMs    = 103
 local autoLatency     = true
 local autoLatencyConn = nil
+local alSongWatcher   = nil   -- watches for new songs to reset phase
 local alPhase         = "hunt"
 
-local GAIN          = 0.5
-local LOCK_THRESH   = 3
-local LOCK_N        = 8
-local UNLOCK_BAD    = 5
-local PERFECT_LOCK  = 40
-local HUNT_INTERVAL = 0.3
-local LOCK_INTERVAL = 1.0
-local OUTLIER_MAX   = 50
+local GAIN           = 0.5    -- correction strength in hunt
+local GAIN_LOCKED    = 0.05   -- correction strength in locked (always active)
+local LOCK_THRESH    = 3      -- ms: avg error below this = good
+local LOCK_N         = 8      -- consecutive good samples to lock
+local UNLOCK_BAD     = 4      -- consecutive bad samples to re-hunt
+local HUNT_INTERVAL  = 0.3    -- seconds between samples when hunting
+local LOCK_INTERVAL  = 0.8    -- seconds between samples when locked
+local OUTLIER_MAX    = 50     -- ms: ignore readings beyond this (misses/holds)
 
-local alBuf          = {}
-local AL_BUF_SIZE    = 12
-local alGoodStreak   = 0
-local alBadStreak    = 0
-local alPerfStreak   = 0
+local alBuf         = {}
+local AL_BUF_SIZE   = 10
+local alGoodStreak  = 0
+local alBadStreak   = 0
 local alSavedHitLate = false
+
+local function alReset(toPhase)
+    alBuf={}; alGoodStreak=0; alBadStreak=0
+    alPhase = toPhase or "hunt"
+end
 
 local function alAvg()
     if #alBuf == 0 then return 0 end
@@ -99,12 +104,28 @@ end
 
 local function startAutoLatency()
     if autoLatencyConn then autoLatencyConn:Disconnect() end
-    alBuf={}; alGoodStreak=0; alBadStreak=0; alPerfStreak=0
-    alPhase = "hunt"
+    alReset("hunt")
     alSavedHitLate = _G.Settings and _G.Settings.HitLate or false
     if _G.Settings then _G.Settings.HitLate = true end
 
+    -- watch for new songs: reset to hunt when a new MatchFrame appears
+    -- use ChildAdded on Main (not DescendantAdded on PlayerGui) to avoid
+    -- firing hundreds of times for every child added inside the gui
+    if alSongWatcher then alSongWatcher:Disconnect() end
+    task.spawn(function()
+        local mainGui = v5.PlayerGui:WaitForChild("Main", 30)
+        if not mainGui then return end
+        alSongWatcher = mainGui.ChildAdded:Connect(function(child)
+            if child.Name == "MatchFrame" then
+                alReset("hunt")
+            end
+        end)
+    end)
+
     local lastSample = 0
+    local msLastText = ""       -- last seen text value
+    local msLastChange = 0      -- tick() when text last changed
+
     autoLatencyConn = RunService.Heartbeat:Connect(function()
         if not autoLatency then return end
         local now = tick()
@@ -117,7 +138,18 @@ local function startAutoLatency()
         if not mf then return end
         local ind = mf:FindFirstChild("msIndic")
         if not (ind and ind.Visible) then return end
-        local val = tonumber((ind.Text or ""):match("(-?%d+%.?%d*)"))
+
+        local txt = ind.Text or ""
+
+        -- only use this reading if the text actually changed recently
+        -- stale text = no notes hit lately = not a valid timing sample
+        if txt ~= msLastText then
+            msLastText = txt
+            msLastChange = now
+        end
+        if now - msLastChange > 0.5 then return end  -- reading is stale, skip
+
+        local val = tonumber(txt:match("(-?%d+%.?%d*)"))
         if not val then return end
         if math.abs(val) > OUTLIER_MAX then return end
 
@@ -126,6 +158,7 @@ local function startAutoLatency()
         local avg = alAvg()
 
         if alPhase == "hunt" then
+            -- aggressive correction
             vimLatencyMs = math.clamp(vimLatencyMs + avg * GAIN, 0, 300)
             if math.abs(avg) <= LOCK_THRESH then
                 alGoodStreak = alGoodStreak + 1; alBadStreak = 0
@@ -135,25 +168,15 @@ local function startAutoLatency()
             else
                 alBadStreak = alBadStreak + 1; alGoodStreak = 0
             end
-        elseif alPhase == "locked" then
-            vimLatencyMs = math.clamp(vimLatencyMs + avg*(GAIN*0.1), 0, 300)
+        else -- locked: always keep nudging, re-hunt if it drifts
+            vimLatencyMs = math.clamp(vimLatencyMs + avg * GAIN_LOCKED, 0, 300)
             if math.abs(avg) <= LOCK_THRESH then
-                alBadStreak=0; alPerfStreak=alPerfStreak+1
-                if alPerfStreak >= PERFECT_LOCK then alPhase="frozen"; alBuf={} end
+                alBadStreak = 0; alGoodStreak = alGoodStreak + 1
             else
-                alBadStreak=alBadStreak+1; alPerfStreak=0
+                alBadStreak = alBadStreak + 1; alGoodStreak = 0
                 if alBadStreak >= UNLOCK_BAD then
-                    alPhase="hunt"; alGoodStreak=0; alBadStreak=0; alBuf={}
+                    alReset("hunt")
                 end
-            end
-        else -- frozen
-            if math.abs(avg) > LOCK_THRESH then
-                alBadStreak=alBadStreak+1
-                if alBadStreak >= UNLOCK_BAD then
-                    alPhase="hunt"; alGoodStreak=0; alBadStreak=0; alPerfStreak=0; alBuf={}
-                end
-            else
-                alBadStreak=0
             end
         end
     end)
@@ -161,8 +184,9 @@ end
 
 local function stopAutoLatency()
     if autoLatencyConn then autoLatencyConn:Disconnect(); autoLatencyConn=nil end
+    if alSongWatcher   then alSongWatcher:Disconnect();   alSongWatcher=nil   end
     if _G.Settings then _G.Settings.HitLate = alSavedHitLate end
-    alPhase="hunt"; alBuf={}; alGoodStreak=0; alBadStreak=0; alPerfStreak=0
+    alReset("hunt")
 end
 
 -- ════════════════════════════════════════════
@@ -484,7 +508,7 @@ infoLeft:AddLabel("InfoL3", {Text="<font color='#5BC8F5'><b>keybind:</b></font> 
 infoRight:AddLabel("IR1",{Text="<font color='#F5A623'><b>features</b></font>"})
 infoRight:AddSeparator("IRS1",{})
 infoRight:AddLabel("IR2",{Text="<font color='#5BC8F5'><b>perfected</b></font>\nuses renderstep for the most accurate timing possible."})
-infoRight:AddLabel("IR3",{Text="<font color='#5BC8F5'><b>auto latency</b></font>\nreads the ms counter and adjusts itself automatically.\nhunt → locked → frozen as it gets more accurate."})
+infoRight:AddLabel("IR3",{Text="<font color='#5BC8F5'><b>auto latency</b></font>\nreads the ms counter and adjusts itself.\nhunt = fast correction at song start.\nlocked = gentle correction, never stops.\nresets on every new song automatically."})
 infoRight:AddLabel("IR4",{Text="<font color='#5BC8F5'><b>tile lights</b></font>\nlights up the mobile buttons when a key is pressed.\njust cosmetic, doesn't change anything."})
 infoRight:AddLabel("IR5",{
     Text="<font color='#5BC8F5'><b>hit chances</b></font>\nthese are weights, not percentages.\nif all are 0 it always hits perfect.\n\n<font color='#F5A623'>windows:</font>\nperfect: 0ms  sick: +45ms\ngood: +75ms   ok: +125ms\nbad: +175ms"
@@ -499,7 +523,7 @@ apGroup:AddToggle("AutoPlayerEnabled", {
     Text="enable", Value=false,
     Tooltip="turns the auto player on or off",
     Callback=function(val)
-        v8=val
+      v8=val
         if v8 then
             laneHoldFrame={nil,nil,nil,nil}; lanePressed={false,false,false,false}
             for i=1,4 do vimUp(i) end
