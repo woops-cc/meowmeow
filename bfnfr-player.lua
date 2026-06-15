@@ -71,23 +71,25 @@ local autoLatencyConn = nil
 local alSongWatcher   = nil   -- watches for new songs to reset phase
 local alPhase         = "hunt"
 
-local GAIN           = 0.5    -- correction strength in hunt
-local GAIN_LOCKED    = 0.05   -- correction strength in locked (always active)
+local GAIN           = 0.25   -- proportional: fraction of avg error to correct each sample
+local GAIN_LOCKED    = 0.04   -- gentler correction when locked
+local INTEGRAL_GAIN  = 0.02   -- integral: accumulates persistent drift over time
 local LOCK_THRESH    = 3      -- ms: avg error below this = good
-local LOCK_N         = 8      -- consecutive good samples to lock
+local LOCK_N         = 10     -- consecutive good samples to lock
 local UNLOCK_BAD     = 4      -- consecutive bad samples to re-hunt
-local HUNT_INTERVAL  = 0.3    -- seconds between samples when hunting
-local LOCK_INTERVAL  = 0.8    -- seconds between samples when locked
-local OUTLIER_MAX    = 50     -- ms: ignore readings beyond this (misses/holds)
+local HUNT_INTERVAL  = 0.25   -- seconds between samples when hunting (faster)
+local LOCK_INTERVAL  = 0.6    -- seconds between samples when locked
+local OUTLIER_MAX    = 45     -- ms: ignore readings beyond this (misses/holds)
 
 local alBuf         = {}
 local AL_BUF_SIZE   = 10
 local alGoodStreak  = 0
 local alBadStreak   = 0
+local alIntegral    = 0       -- accumulated drift for integral correction
 local alSavedHitLate = false
 
 local function alReset(toPhase)
-    alBuf={}; alGoodStreak=0; alBadStreak=0
+    alBuf={}; alGoodStreak=0; alBadStreak=0; alIntegral=0
     alPhase = toPhase or "hunt"
 end
 
@@ -158,18 +160,27 @@ local function startAutoLatency()
         local avg = alAvg()
 
         if alPhase == "hunt" then
-            -- aggressive correction
-            vimLatencyMs = math.clamp(vimLatencyMs + avg * GAIN, 0, 300)
+            -- PI controller: proportional (fast response) + integral (removes steady-state error)
+            alIntegral = alIntegral + avg * INTEGRAL_GAIN
+            alIntegral = math.clamp(alIntegral, -30, 30)  -- prevent windup
+            local correction = avg * GAIN + alIntegral
+            vimLatencyMs = math.clamp(vimLatencyMs + correction, 0, 300)
+
             if math.abs(avg) <= LOCK_THRESH then
                 alGoodStreak = alGoodStreak + 1; alBadStreak = 0
                 if alGoodStreak >= LOCK_N then
                     alPhase="locked"; alGoodStreak=0; alBadStreak=0; alBuf={}
+                    alIntegral = alIntegral * 0.5  -- halve integral on transition
                 end
             else
                 alBadStreak = alBadStreak + 1; alGoodStreak = 0
             end
-        else -- locked: always keep nudging, re-hunt if it drifts
-            vimLatencyMs = math.clamp(vimLatencyMs + avg * GAIN_LOCKED, 0, 300)
+        else -- locked: gentle PI, re-hunt if it drifts
+            alIntegral = alIntegral + avg * (INTEGRAL_GAIN * 0.3)
+            alIntegral = math.clamp(alIntegral, -10, 10)
+            local correction = avg * GAIN_LOCKED + alIntegral
+            vimLatencyMs = math.clamp(vimLatencyMs + correction, 0, 300)
+
             if math.abs(avg) <= LOCK_THRESH then
                 alBadStreak = 0; alGoodStreak = alGoodStreak + 1
             else
@@ -307,24 +318,31 @@ end
 -- ════════════════════════════════════════════
 -- hold timer
 -- ────────────────────────────────────────────
--- the hold tail's size encodes exactly how long to hold:
---   downscroll: Size.Y.Scale = +v98 * 5.5 * spd
---   upscroll:   Size.Y.Scale = -v98 * 5.5 * spd  (negative!)
---   where v98 = holdDuration - 0.07
---   so:  holdDuration = |scale| / (5.5 * spd) + 0.07
+-- exact math from CreateNote source:
+--   v98 = max(0, p88 - 0.07),  clamped to 0 if <= 0.03
+--   Size.Y.Scale = v98 * 5.5 * spd  (negative for upscroll)
+--   Debris:AddItem(holdFrame, p88 + 4)
 --
--- we track when we pressed and subtract that elapsed time so the
--- release fires at the correct moment even if fire() had a delay
+-- so: p88 = |scale| / (5.5 * spd) + 0.07
+--
+-- we press the key vimLatencyMs before the note reaches the receptor.
+-- the game registers the hold start when VIM delivers our keydown,
+-- which is ~vimLatencyMs later = approximately at the receptor.
+-- Debris destroys the frame p88 seconds after the note was spawned.
+-- the note reaches receptor at exactly t=2s after spawn (from 11*spd
+-- over 4s, receptor at 0 = halfway point).
+-- so from our keydown the hold lasts: p88 - (lead time already consumed)
+-- lead time = vimLatencyMs/1000  (we pressed that early)
+-- remaining after pressing = p88 - vimLatencyMs/1000 - elapsed_since_press
 -- ════════════════════════════════════════════
 local function holdForDuration(lane, holdFrame, spd, pressedAt)
     laneHoldFrame[lane] = holdFrame
 
-    local tailScale = math.abs(holdFrame.Size.Y.Scale)
-    -- exact duration from source math, no arbitrary buffer
-    local holdDuration = tailScale / (5.5 * spd) + 0.07
-    -- subtract time already spent since we pressed the key
-    local elapsed  = tick() - pressedAt
-    local remaining = math.max(0, holdDuration - elapsed)
+    local tailScale   = math.abs(holdFrame.Size.Y.Scale)
+    local p88         = tailScale / (5.5 * spd) + 0.07
+    local leadTime    = vimLatencyMs / 1000   -- how early we pressed vs receptor
+    local elapsed     = tick() - pressedAt    -- time since vimDown was called
+    local remaining   = math.max(0, p88 - leadTime - elapsed)
 
     task.delay(remaining, function()
         if laneHoldFrame[lane] == holdFrame then
@@ -523,7 +541,7 @@ apGroup:AddToggle("AutoPlayerEnabled", {
     Text="enable", Value=false,
     Tooltip="turns the auto player on or off",
     Callback=function(val)
-      v8=val
+        v8=val
         if v8 then
             laneHoldFrame={nil,nil,nil,nil}; lanePressed={false,false,false,false}
             for i=1,4 do vimUp(i) end
