@@ -1,14 +1,15 @@
 local lib = loadstring(game:HttpGet("https://raw.githubusercontent.com/Null-Cherry/Fire-Library/refs/heads/main/Loader.lua", true))()
 
-local C_BLUE   = Color3.fromRGB(91,  200, 245)
-local C_ORANGE = Color3.fromRGB(245, 166, 35)
-local C_WHITE  = Color3.fromRGB(220, 220, 225)
-local C_BG     = Color3.fromRGB(18,  18,  22)
+-- ── palette (original oc colors) ──
+local C_BLUE   = Color3.fromRGB(91,  200, 245)   -- sky blue  #5BC8F5
+local C_ORANGE = Color3.fromRGB(245, 166, 35)    -- gold      #F5A623
+local C_BG     = Color3.fromRGB(18,  18,  22)    -- dark bg
+local C_WHITE  = Color3.fromRGB(220, 220, 225)   -- soft white text
 
-local window = lib:Window("w0opsie_ap", {
-    Title    = "<font color='#5BC8F5'>w0</font><font color='#F5A623'>o</font><font color='#5BC8F5'>opsie's ap</font>",
+local window = lib:Window("bfnfr_ap", {
+    Title    = "<font color='#5BC8F5'><b>fnf:r</b></font><font color='#F5A623'> autoplay</font>",
     Icon     = "76468651273482",
-    Footer   = "<font color='#5BC8F5'>basically fnf: remix</font>",
+    Footer   = "<font color='#5BC8F5'>woops <3</font>  ·  basically fnf: remix",
     Keybind  = Enum.KeyCode.RightShift,
     NeonType      = "Top",
     NeonThickness = 2,
@@ -52,56 +53,63 @@ local VIM          = game:GetService("VirtualInputManager")
 local Players      = game:GetService("Players")
 local v5           = Players.LocalPlayer
 
--- ════════════════════════════════════════════
--- timing
--- ────────────────────────────────────────────
--- notes have a perfect window of |scale| <= 0.71775 * scrollspeed
--- we fire vim slightly before that window so by the time the input
--- registers, the note is exactly at the receptor (scale = 0)
--- formula: trigger = (0.71775 - latency_in_seconds * 5.5) * spd
+-- ════════════════════════════════════════════════════════════
+-- timing & auto latency
+-- ────────────────────────────────────────────────────────────
+-- perfect window:  |scale| <= 0.71775 * spd
+-- trigger formula: (0.71775 - latMs/1000 * 5.5) * spd
 --
--- auto latency reads the ms counter and self-corrects:
---   hunt   → fast samples every 0.3s, corrects aggressively
---   locked → slow samples every 1s, tiny corrections (never fully stops)
---   resets to hunt on every new song so scroll speed changes are handled
--- ════════════════════════════════════════════
+-- auto latency — two phases:
+--   hunt:   sample every 0.25s, PI correction, converges fast
+--   locked: sample every 0.8s, micro-nudge only (±0.3ms max)
+--           only re-hunts if sustained drift > 5ms for 6+ samples
+--           vimLatencyMs is essentially frozen once locked
+--
+-- stale-reading guard: skip samples where msIndic text hasn't
+-- changed in the last 0.4s (no notes hit = stale value)
+-- ════════════════════════════════════════════════════════════
 local vimLatencyMs    = 103
 local autoLatency     = true
 local autoLatencyConn = nil
-local alSongWatcher   = nil   -- watches for new songs to reset phase
+local alSongWatcher   = nil
 local alPhase         = "hunt"
 
-local GAIN           = 0.25   -- proportional: fraction of avg error to correct each sample
-local GAIN_LOCKED    = 0.04   -- gentler correction when locked
-local INTEGRAL_GAIN  = 0.02   -- integral: accumulates persistent drift over time
-local LOCK_THRESH    = 3      -- ms: avg error below this = good
-local LOCK_N         = 10     -- consecutive good samples to lock
-local UNLOCK_BAD     = 4      -- consecutive bad samples to re-hunt
-local HUNT_INTERVAL  = 0.25   -- seconds between samples when hunting (faster)
-local LOCK_INTERVAL  = 0.6    -- seconds between samples when locked
-local OUTLIER_MAX    = 45     -- ms: ignore readings beyond this (misses/holds)
+-- hunt PI gains
+local P_GAIN        = 0.20    -- proportional
+local I_GAIN        = 0.015   -- integral (slowly removes residual error)
+local I_CLAMP       = 20      -- max integral accumulation (ms)
+-- locked micro-nudge
+local LOCK_NUDGE    = 0.3     -- max ms change per locked sample
+-- thresholds
+local LOCK_THRESH   = 2.5     -- ms: avg error below this = good
+local LOCK_N        = 12      -- consecutive good samples → lock
+local UNLOCK_THRESH = 6       -- ms: avg error above this = bad (when locked)
+local UNLOCK_N      = 7       -- consecutive bad samples → re-hunt
+local HUNT_INTERVAL = 0.25
+local LOCK_INTERVAL = 0.8
+local OUTLIER_MAX   = 40      -- ms: ignore (holds/misses contaminate buffer)
+local BUF_SIZE      = 12
 
 local alBuf         = {}
-local AL_BUF_SIZE   = 10
-local alGoodStreak  = 0
-local alBadStreak   = 0
-local alIntegral    = 0       -- accumulated drift for integral correction
+local alGoodN       = 0
+local alBadN        = 0
+local alIntegral    = 0
 local alSavedHitLate = false
 
-local function alReset(toPhase)
-    alBuf={}; alGoodStreak=0; alBadStreak=0; alIntegral=0
-    alPhase = toPhase or "hunt"
+local function alReset(phase)
+    alBuf={}; alGoodN=0; alBadN=0; alIntegral=0
+    alPhase = phase or "hunt"
 end
 
 local function alAvg()
     if #alBuf == 0 then return 0 end
-    local s = 0; for _,v in ipairs(alBuf) do s=s+v end
-    return s / #alBuf
+    local s=0; for _,v in ipairs(alBuf) do s=s+v end
+    return s/#alBuf
 end
 
 local function calcTriggerScale(spd)
-    local coeff = math.clamp(0.71775 - (vimLatencyMs/1000)*5.5, 0.05, 0.71775)
-    return coeff * spd
+    local c = math.clamp(0.71775 - (vimLatencyMs/1000)*5.5, 0.05, 0.71775)
+    return c * spd
 end
 
 local function startAutoLatency()
@@ -110,23 +118,18 @@ local function startAutoLatency()
     alSavedHitLate = _G.Settings and _G.Settings.HitLate or false
     if _G.Settings then _G.Settings.HitLate = true end
 
-    -- watch for new songs: reset to hunt when a new MatchFrame appears
-    -- use ChildAdded on Main (not DescendantAdded on PlayerGui) to avoid
-    -- firing hundreds of times for every child added inside the gui
     if alSongWatcher then alSongWatcher:Disconnect() end
     task.spawn(function()
-        local mainGui = v5.PlayerGui:WaitForChild("Main", 30)
-        if not mainGui then return end
-        alSongWatcher = mainGui.ChildAdded:Connect(function(child)
-            if child.Name == "MatchFrame" then
-                alReset("hunt")
-            end
+        local mg = v5.PlayerGui:WaitForChild("Main", 30)
+        if not mg then return end
+        alSongWatcher = mg.ChildAdded:Connect(function(c)
+            if c.Name == "MatchFrame" then alReset("hunt") end
         end)
     end)
 
-    local lastSample = 0
-    local msLastText = ""       -- last seen text value
-    local msLastChange = 0      -- tick() when text last changed
+    local lastSample   = 0
+    local lastText     = ""
+    local lastTextTime = 0
 
     autoLatencyConn = RunService.Heartbeat:Connect(function()
         if not autoLatency then return end
@@ -142,52 +145,41 @@ local function startAutoLatency()
         if not (ind and ind.Visible) then return end
 
         local txt = ind.Text or ""
-
-        -- only use this reading if the text actually changed recently
-        -- stale text = no notes hit lately = not a valid timing sample
-        if txt ~= msLastText then
-            msLastText = txt
-            msLastChange = now
-        end
-        if now - msLastChange > 0.5 then return end  -- reading is stale, skip
+        if txt ~= lastText then lastText=txt; lastTextTime=now end
+        if now - lastTextTime > 0.4 then return end   -- stale, skip
 
         local val = tonumber(txt:match("(-?%d+%.?%d*)"))
-        if not val then return end
-        if math.abs(val) > OUTLIER_MAX then return end
+        if not val or math.abs(val) > OUTLIER_MAX then return end
 
         table.insert(alBuf, val)
-        if #alBuf > AL_BUF_SIZE then table.remove(alBuf, 1) end
+        if #alBuf > BUF_SIZE then table.remove(alBuf,1) end
         local avg = alAvg()
 
         if alPhase == "hunt" then
-            -- PI controller: proportional (fast response) + integral (removes steady-state error)
-            alIntegral = alIntegral + avg * INTEGRAL_GAIN
-            alIntegral = math.clamp(alIntegral, -30, 30)  -- prevent windup
-            local correction = avg * GAIN + alIntegral
-            vimLatencyMs = math.clamp(vimLatencyMs + correction, 0, 300)
+            alIntegral = math.clamp(alIntegral + avg*I_GAIN, -I_CLAMP, I_CLAMP)
+            local corr = avg*P_GAIN + alIntegral
+            vimLatencyMs = math.clamp(vimLatencyMs + corr, 0, 300)
 
             if math.abs(avg) <= LOCK_THRESH then
-                alGoodStreak = alGoodStreak + 1; alBadStreak = 0
-                if alGoodStreak >= LOCK_N then
-                    alPhase="locked"; alGoodStreak=0; alBadStreak=0; alBuf={}
-                    alIntegral = alIntegral * 0.5  -- halve integral on transition
+                alGoodN=alGoodN+1; alBadN=0
+                if alGoodN >= LOCK_N then
+                    alPhase="locked"; alGoodN=0; alBadN=0; alBuf={}
+                    alIntegral = alIntegral * 0.3  -- bleed off most integral on lock
                 end
             else
-                alBadStreak = alBadStreak + 1; alGoodStreak = 0
+                alBadN=alBadN+1; alGoodN=0
             end
-        else -- locked: gentle PI, re-hunt if it drifts
-            alIntegral = alIntegral + avg * (INTEGRAL_GAIN * 0.3)
-            alIntegral = math.clamp(alIntegral, -10, 10)
-            local correction = avg * GAIN_LOCKED + alIntegral
-            vimLatencyMs = math.clamp(vimLatencyMs + correction, 0, 300)
 
-            if math.abs(avg) <= LOCK_THRESH then
-                alBadStreak = 0; alGoodStreak = alGoodStreak + 1
+        else  -- locked: micro-nudge only, strong hysteresis before re-hunting
+            -- tiny correction capped at LOCK_NUDGE ms per sample
+            local nudge = math.clamp(avg * 0.08, -LOCK_NUDGE, LOCK_NUDGE)
+            vimLatencyMs = math.clamp(vimLatencyMs + nudge, 0, 300)
+
+            if math.abs(avg) > UNLOCK_THRESH then
+                alBadN=alBadN+1; alGoodN=0
+                if alBadN >= UNLOCK_N then alReset("hunt") end
             else
-                alBadStreak = alBadStreak + 1; alGoodStreak = 0
-                if alBadStreak >= UNLOCK_BAD then
-                    alReset("hunt")
-                end
+                alBadN=0; alGoodN=alGoodN+1
             end
         end
     end)
@@ -200,17 +192,12 @@ local function stopAutoLatency()
     alReset("hunt")
 end
 
--- ════════════════════════════════════════════
--- keybinds
--- ════════════════════════════════════════════
-local v4 = {
-    KeyBinds    = {Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.W, Enum.KeyCode.D},
-    TapDuration = 0.05,
-}
+-- ════════════════════════════════════════════════════════════
+-- keybinds & state
+-- ════════════════════════════════════════════════════════════
+local KEYS        = {Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.W, Enum.KeyCode.D}
+local TAP_DUR     = 0.05
 
--- ════════════════════════════════════════════
--- state
--- ════════════════════════════════════════════
 local v8            = false
 local missJacks     = false
 local legitMode     = false
@@ -218,8 +205,8 @@ local perfected     = false
 local tileLights    = false
 local mainLoop      = nil
 
-local laneHoldFrame = {nil, nil, nil, nil}
-local lanePressed   = {false, false, false, false}
+local laneHoldFrame = {nil,nil,nil,nil}
+local lanePressed   = {false,false,false,false}
 local seenNotes     = {}
 
 local minReaction   = 0
@@ -235,149 +222,124 @@ local platformContent    = "😇"
 local platformAutoRejoin = true
 local kpsLog = {}
 
--- ════════════════════════════════════════════
+-- ════════════════════════════════════════════════════════════
 -- tile lighting
--- ────────────────────────────────────────────
--- buttons live at matchframe.mobilekeys.left/down/up/right
--- press  → transparency = 0   (lit)
--- release → tween to 0.8      (fade out, matches game behavior)
--- ════════════════════════════════════════════
-local TILE_NAMES     = {"Left","Down","Up","Right"}
-local TILE_TWEEN_INF = TweenInfo.new(0.1, Enum.EasingStyle.Cubic, Enum.EasingDirection.Out)
-local tileTweens     = {}
+-- path: MatchFrame.MobileKeys.Left/Down/Up/Right
+-- press → transparency 0, release → tween to 0.8
+-- ════════════════════════════════════════════════════════════
+local TILE_NAMES = {"Left","Down","Up","Right"}
+local TILE_TW    = TweenInfo.new(0.1, Enum.EasingStyle.Cubic, Enum.EasingDirection.Out)
+local tileTweens = {}
 
 local function getMobileTile(lane)
-    local ok, result = pcall(function()
+    local ok,r = pcall(function()
         return v5.PlayerGui.Main.MatchFrame.MobileKeys[TILE_NAMES[lane]]
     end)
-    return ok and result or nil
+    return ok and r or nil
 end
 
 local function lightTile(lane, lit)
     if not tileLights then return end
-    local tile = getMobileTile(lane)
-    if not tile then return end
+    local t = getMobileTile(lane)
+    if not t then return end
     if tileTweens[lane] then tileTweens[lane]:Cancel(); tileTweens[lane]=nil end
     if lit then
-        tile.ImageTransparency = 0
+        t.ImageTransparency = 0
     else
-        local tw = TweenService:Create(tile, TILE_TWEEN_INF, {ImageTransparency=0.8})
-        tileTweens[lane] = tw; tw:Play()
+        local tw = TweenService:Create(t, TILE_TW, {ImageTransparency=0.8})
+        tileTweens[lane]=tw; tw:Play()
     end
 end
 
--- ════════════════════════════════════════════
--- vim input
--- ════════════════════════════════════════════
+-- ════════════════════════════════════════════════════════════
+-- vim helpers
+-- ════════════════════════════════════════════════════════════
 local function vimDown(lane)
     if not lanePressed[lane] then
-        lanePressed[lane] = true
-        VIM:SendKeyEvent(true, v4.KeyBinds[lane], false, game)
+        lanePressed[lane]=true
+        VIM:SendKeyEvent(true, KEYS[lane], false, game)
         lightTile(lane, true)
     end
 end
 
 local function vimUp(lane)
     if lanePressed[lane] then
-        lanePressed[lane] = false
-        VIM:SendKeyEvent(false, v4.KeyBinds[lane], false, game)
+        lanePressed[lane]=false
+        VIM:SendKeyEvent(false, KEYS[lane], false, game)
         lightTile(lane, false)
     end
 end
 
 local function vimTap(lane)
     vimUp(lane); vimDown(lane)
-    task.delay(v4.TapDuration, function() vimUp(lane) end)
+    task.delay(TAP_DUR, function() vimUp(lane) end)
 end
 
--- ════════════════════════════════════════════
--- hold visual reset
--- ════════════════════════════════════════════
+-- ════════════════════════════════════════════════════════════
+-- hold system
+-- hold duration from source:
+--   v98 = max(0, p88-0.07), clamped 0 if <=0.03
+--   Size.Y.Scale = v98 * 5.5 * spd  (negative in upscroll)
+--   → p88 = |scale|/(5.5*spd) + 0.07
+-- we pressed vimLatencyMs early, so hold for p88 - latency_sec
+-- ════════════════════════════════════════════════════════════
 local function resetLnHold(lane)
     pcall(function()
         local mf = v5.PlayerGui.Main.MatchFrame
-        for s = 1, 2 do
+        for s=1,2 do
             local ar = mf:FindFirstChild("KeySync"..s)
                    and mf["KeySync"..s]:FindFirstChild("Arrow"..lane)
             if ar then
                 local ln = ar:FindFirstChild("LnHold")
-                if ln then ln.ImageTransparency = 1 end
+                if ln then ln.ImageTransparency=1 end
             end
         end
     end)
 end
 
 local function stopHold(lane, interrupted)
-    laneHoldFrame[lane] = nil
+    laneHoldFrame[lane]=nil
     vimUp(lane)
-    -- only reset the hold glow when we interrupt early (new note came in)
-    -- on a natural hold end the game resets it itself
     if interrupted then resetLnHold(lane) end
 end
 
--- ════════════════════════════════════════════
--- hold timer
--- ────────────────────────────────────────────
--- exact math from CreateNote source:
---   v98 = max(0, p88 - 0.07),  clamped to 0 if <= 0.03
---   Size.Y.Scale = v98 * 5.5 * spd  (negative for upscroll)
---   Debris:AddItem(holdFrame, p88 + 4)
---
--- so: p88 = |scale| / (5.5 * spd) + 0.07
---
--- we press the key vimLatencyMs before the note reaches the receptor.
--- the game registers the hold start when VIM delivers our keydown,
--- which is ~vimLatencyMs later = approximately at the receptor.
--- Debris destroys the frame p88 seconds after the note was spawned.
--- the note reaches receptor at exactly t=2s after spawn (from 11*spd
--- over 4s, receptor at 0 = halfway point).
--- so from our keydown the hold lasts: p88 - (lead time already consumed)
--- lead time = vimLatencyMs/1000  (we pressed that early)
--- remaining after pressing = p88 - vimLatencyMs/1000 - elapsed_since_press
--- ════════════════════════════════════════════
 local function holdForDuration(lane, holdFrame, spd, pressedAt)
     laneHoldFrame[lane] = holdFrame
-
-    local tailScale   = math.abs(holdFrame.Size.Y.Scale)
-    local p88         = tailScale / (5.5 * spd) + 0.07
-    local leadTime    = vimLatencyMs / 1000   -- how early we pressed vs receptor
-    local elapsed     = tick() - pressedAt    -- time since vimDown was called
-    local remaining   = math.max(0, p88 - leadTime - elapsed)
-
-    task.delay(remaining, function()
-        if laneHoldFrame[lane] == holdFrame then
-            stopHold(lane, false)
-        end
+    local scale   = math.abs(holdFrame.Size.Y.Scale)
+    local p88     = scale / (5.5*spd) + 0.07
+    local leadSec = vimLatencyMs / 1000
+    local elapsed = tick() - pressedAt
+    local rem     = math.max(0, p88 - leadSec - elapsed)
+    task.delay(rem, function()
+        if laneHoldFrame[lane] == holdFrame then stopHold(lane,false) end
     end)
 end
 
--- ════════════════════════════════════════════
+-- ════════════════════════════════════════════════════════════
 -- helpers
--- ════════════════════════════════════════════
-local HIT_OFFSETS = {sick=0.045, good=0.075, ok=0.125, bad=0.175}
+-- ════════════════════════════════════════════════════════════
+local HIT_OFF = {sick=0.045, good=0.075, ok=0.125, bad=0.175}
 
 local function pickRating()
-    local pool = {}
-    for _=1,perfectChance do table.insert(pool,"perfect") end
-    for _=1,sickChance    do table.insert(pool,"sick")    end
-    for _=1,goodChance    do table.insert(pool,"good")    end
-    for _=1,okChance      do table.insert(pool,"ok")      end
-    for _=1,badChance     do table.insert(pool,"bad")     end
-    for _=1,missChance    do table.insert(pool,"miss")    end
-    if #pool == 0 then return "perfect" end
+    local pool={}
+    for _=1,perfectChance do pool[#pool+1]="perfect" end
+    for _=1,sickChance    do pool[#pool+1]="sick"    end
+    for _=1,goodChance    do pool[#pool+1]="good"    end
+    for _=1,okChance      do pool[#pool+1]="ok"      end
+    for _=1,badChance     do pool[#pool+1]="bad"     end
+    for _=1,missChance    do pool[#pool+1]="miss"    end
+    if #pool==0 then return "perfect" end
     return pool[math.random(1,#pool)]
 end
 
 local function canPress()
     if not legitMode then return true end
-    local now = tick()
-    local i = 1
-    while i <= #kpsLog do
-        if now - kpsLog[i] > 1 then table.remove(kpsLog,i) else i=i+1 end
+    local now=tick(); local i=1
+    while i<=#kpsLog do
+        if now-kpsLog[i]>1 then table.remove(kpsLog,i) else i=i+1 end
     end
-    if #kpsLog >= legitKpsLimit then return false end
-    table.insert(kpsLog, now)
-    return true
+    if #kpsLog>=legitKpsLimit then return false end
+    kpsLog[#kpsLog+1]=now; return true
 end
 
 local function getMyKeySync()
@@ -386,28 +348,24 @@ local function getMyKeySync()
     if not (M and M.Visible) then return nil end
     local pv = v5:FindFirstChild("File") and v5.File:FindFirstChild("CurrentPlayer")
     if pv and pv.Value then
-        local side = pv.Value.Name == "Player2" and 2 or 1
-        return M:FindFirstChild("KeySync"..side)
+        return M:FindFirstChild("KeySync"..(pv.Value.Name=="Player2" and 2 or 1))
     end
 end
 
--- ════════════════════════════════════════════
+-- ════════════════════════════════════════════════════════════
 -- note handler
--- ════════════════════════════════════════════
+-- ════════════════════════════════════════════════════════════
 local function handleNote(lane, isHold, holdFrame, arrowFrame, sync, spd)
     if not canPress() then return end
     local rating = pickRating()
-    if rating == "miss" then return end
-    if laneHoldFrame[lane] then stopHold(lane, true) end
+    if rating=="miss" then return end
+    if laneHoldFrame[lane] then stopHold(lane,true) end
 
     local function fire()
         local pressedAt = tick()
         if isHold then
-            -- short holds (blue notes) have Size.Y.Scale = exactly 0
-            -- because the source clamps v98 to 0 when duration <= 0.10s
-            -- real holds always have |scale| >= 0.88 so 0.01 is a safe cutoff
-            local tailScale = holdFrame and math.abs(holdFrame.Size.Y.Scale) or 0
-            if tailScale < 0.01 then
+            local sc = holdFrame and math.abs(holdFrame.Size.Y.Scale) or 0
+            if sc < 0.01 then   -- short hold (blue note) — tap it
                 vimTap(lane)
             else
                 vimUp(lane); vimDown(lane)
@@ -423,12 +381,12 @@ local function handleNote(lane, isHold, holdFrame, arrowFrame, sync, spd)
     else
         task.spawn(function()
             if maxReaction > 0 then
-                local lo = math.min(minReaction,maxReaction)
-                local hi = math.max(minReaction,maxReaction)
+                local lo=math.min(minReaction,maxReaction)
+                local hi=math.max(minReaction,maxReaction)
                 task.wait((lo==hi and lo or math.random(lo,hi))/1000)
             end
-            if rating ~= "perfect" then
-                local off = HIT_OFFSETS[rating]
+            if rating~="perfect" then
+                local off=HIT_OFF[rating]
                 if off then task.wait(off) end
             end
             fire()
@@ -436,61 +394,70 @@ local function handleNote(lane, isHold, holdFrame, arrowFrame, sync, spd)
     end
 end
 
--- ════════════════════════════════════════════
+-- ════════════════════════════════════════════════════════════
 -- main loop
--- ════════════════════════════════════════════
+-- ────────────────────────────────────────────────────────────
+-- sv support: spd is read from _G.Settings.NoteSpeed every frame
+-- lag-spike recovery: scan up to 2x the trigger window so notes
+-- that drifted past the normal trigger during a frame drop are
+-- still caught and fired rather than missed
+-- ════════════════════════════════════════════════════════════
 local function startLoop()
     if mainLoop then mainLoop:Disconnect(); mainLoop=nil end
-    seenNotes = {}
-    local cacheBuilt = {}
+    seenNotes={}
+    local cacheBuilt={}
 
     local function tick_fn(sync)
         if not v8 then return end
         local KS = getMyKeySync()
         if not (KS and KS.Visible) then return end
 
-        local spd = math.clamp(tonumber((_G and _G.Settings and _G.Settings.NoteSpeed) or 2) or 2, 0.8, 5)
-        local triggerScale = calcTriggerScale(spd)
+        -- sv: re-read speed every frame (handles mid-song sv changes)
+        local spd = math.clamp(
+            tonumber((_G and _G.Settings and _G.Settings.NoteSpeed) or 2) or 2,
+            0.5, 10)
+        local trigger  = calcTriggerScale(spd)
+        -- rescue window: catch notes that slipped past trigger during lag spikes
+        -- capped at half the perfect window so we don't fire too early
+        local rescue   = math.min(trigger * 1.8, 0.71775 * spd)
 
-        for lane = 1, 4 do
-            local arrowFrame = KS:FindFirstChild("Arrow"..lane)
-            local notesFrame = arrowFrame and arrowFrame:FindFirstChild("Notes")
-            if not (arrowFrame and notesFrame) then continue end
+        for lane=1,4 do
+            local af = KS:FindFirstChild("Arrow"..lane)
+            local nf = af and af:FindFirstChild("Notes")
+            if not (af and nf) then continue end
 
             if not cacheBuilt[lane] then
-                cacheBuilt[lane] = true
-                notesFrame.ChildAdded:Connect(function(child)
-                    child.AncestryChanged:Connect(function()
-                        if not child:IsDescendantOf(game) then seenNotes[child]=nil end
+                cacheBuilt[lane]=true
+                nf.ChildAdded:Connect(function(c)
+                    c.AncestryChanged:Connect(function()
+                        if not c:IsDescendantOf(game) then seenNotes[c]=nil end
                     end)
                 end)
             end
 
-            local bestNote, bestDist = nil, math.huge
-            for _, child in ipairs(notesFrame:GetChildren()) do
-                if not child:IsA("GuiObject") then continue end
-                if child.Name:sub(1,5) == "Hold_" then continue end
-                if not child.Visible then continue end
-                if seenNotes[child] then continue end
-                local dist = math.abs(child.Position.Y.Scale)
-                if dist <= triggerScale and dist < bestDist then
-                    bestDist=dist; bestNote=child
+            local best, bestDist = nil, math.huge
+            for _, c in ipairs(nf:GetChildren()) do
+                if not c:IsA("GuiObject") then continue end
+                if c.Name:sub(1,5)=="Hold_" then continue end
+                if not c.Visible then continue end
+                if seenNotes[c] then continue end
+                local d = math.abs(c.Position.Y.Scale)
+                if d <= rescue and d < bestDist then
+                    bestDist=d; best=c
                 end
             end
 
-            if not bestNote then continue end
-            seenNotes[bestNote] = true
+            if not best then continue end
+            seenNotes[best]=true
 
-            local isHold    = bestNote:GetAttribute("HoldHead") == true
-            local holdFrame = isHold and notesFrame:FindFirstChild("Hold_"..bestNote.Name) or nil
+            local isHold    = best:GetAttribute("HoldHead")==true
+            local holdFrame = isHold and nf:FindFirstChild("Hold_"..best.Name) or nil
             if isHold and not holdFrame then isHold=false end
 
-            if laneHoldFrame[lane] then stopHold(lane, true) end
-            handleNote(lane, isHold, holdFrame, arrowFrame, sync, spd)
+            if laneHoldFrame[lane] then stopHold(lane,true) end
+            handleNote(lane, isHold, holdFrame, af, sync, spd)
 
-            bestNote.AncestryChanged:Once(function()
-                seenNotes[bestNote]=nil
-            end)
+            best.AncestryChanged:Once(function() seenNotes[best]=nil end)
         end
     end
 
@@ -501,45 +468,39 @@ local function startLoop()
     end
 end
 
--- ════════════════════════════════════════════
--- tabs
--- ════════════════════════════════════════════
-local infoTab     = window:AddTab("InfoTab",     {Text="info"    })
-local mainTab     = window:AddTab("MainTab",     {Text="main"    })
-local miscTab     = window:AddTab("MiscTab",     {Text="misc"    })
-local settingsTab = window:AddTab("SettingsTab", {Text="settings"})
+-- ════════════════════════════════════════════════════════════
+-- ui — NullFire-inspired clean layout
+-- ════════════════════════════════════════════════════════════
+local infoTab  = window:AddTab("InfoTab",  {Text="📖 info"   })
+local playTab  = window:AddTab("PlayTab",  {Text="⚡ play"   })
+local tuneTab  = window:AddTab("TuneTab",  {Text="🎯 tune"   })
+local miscTab  = window:AddTab("MiscTab",  {Text="🎭 misc"   })
 
--- ── info ─────────────────────────────────────
-local infoLeft  = infoTab:AddLeftGroupbox("InfoLeft",  {Text="welcome"     })
-local infoRight = infoTab:AddRightGroupbox("InfoRight", {Text="how it works"})
+-- ── info ─────────────────────────────────────────────────────
+local iL = infoTab:AddLeftGroupbox("IL",  {Text="about"       })
+local iR = infoTab:AddRightGroupbox("IR", {Text="feature list" })
 
-infoLeft:AddLabel("InfoL1", {
-    Text="<font color='#5BC8F5'><b>woops <3 auto player</b></font>\nmade with love\n\nautomatically plays <b>basically fnf: remix</b> for you!"
-})
-infoLeft:AddSeparator("IS1",{})
-infoLeft:AddLabel("InfoL2", {
-    Text="<font color='#F5A623'><b>best settings:</b></font>\n• perfected: on\n• auto latency: on\n• perfect weight: 100, rest 0"
-})
-infoLeft:AddSeparator("IS2",{})
-infoLeft:AddLabel("InfoL3", {Text="<font color='#5BC8F5'><b>keybind:</b></font> rightshift = open/close"})
+iL:AddLabel("IL1",{Text="<font color='#5BC8F5'><b>fnf:r autoplay</b></font> by woops <3\n\nplays basically fnf: remix for you.\nperfected mode hits ~0ms consistently.\nauto latency self-tunes after ~3 seconds."})
+iL:AddSeparator("ILS1",{})
+iL:AddLabel("IL2",{Text="<font color='#F5A623'><b>recommended:</b></font>\n• perfected → on\n• auto latency → on\n• all hit chances at 0 (always perfect)"})
+iL:AddSeparator("ILS2",{})
+iL:AddLabel("IL3",{Text="<b>rightshift</b> = open / close"})
 
-infoRight:AddLabel("IR1",{Text="<font color='#F5A623'><b>features</b></font>"})
-infoRight:AddSeparator("IRS1",{})
-infoRight:AddLabel("IR2",{Text="<font color='#5BC8F5'><b>perfected</b></font>\nuses renderstep for the most accurate timing possible."})
-infoRight:AddLabel("IR3",{Text="<font color='#5BC8F5'><b>auto latency</b></font>\nreads the ms counter and adjusts itself.\nhunt = fast correction at song start.\nlocked = gentle correction, never stops.\nresets on every new song automatically."})
-infoRight:AddLabel("IR4",{Text="<font color='#5BC8F5'><b>tile lights</b></font>\nlights up the mobile buttons when a key is pressed.\njust cosmetic, doesn't change anything."})
-infoRight:AddLabel("IR5",{
-    Text="<font color='#5BC8F5'><b>hit chances</b></font>\nthese are weights, not percentages.\nif all are 0 it always hits perfect.\n\n<font color='#F5A623'>windows:</font>\nperfect: 0ms  sick: +45ms\ngood: +75ms   ok: +125ms\nbad: +175ms"
-})
+iR:AddLabel("IR1",{Text="<font color='#5BC8F5'><b>play tab</b></font>"})
+iR:AddLabel("IR2",{Text="enable → turns autoplay on/off\nperfected → renderstep timing (best accuracy)\ntile lights → lights up mobile buttons cosmetically\nmiss jacks → skips rapid same-key notes\nlegit mode → human-like kps cap + mixed ratings"})
+iR:AddSeparator("IRS1",{})
+iR:AddLabel("IR3",{Text="<font color='#F5A623'><b>tune tab</b></font>"})
+iR:AddLabel("IR4",{Text="auto latency → reads ms counter, self-tunes.\n  hunt phase: fast corrections every 0.25s\n  locked phase: near-frozen, micro-nudge only\n  re-hunts automatically if timing drifts\nvim latency → manual override (auto off only)\nhit chances → weights, not %. 0 = always perfect."})
+iR:AddSeparator("IRS2",{})
+iR:AddLabel("IR5",{Text="<font color='#5BC8F5'><b>supported</b></font>\n✓ sv (mid-song speed changes)\n✓ up & down scroll\n✓ mod charts\n✓ 60fps+  ✓ low fps (lag rescue scan)\n✓ hold notes  ✓ short holds (blue notes)"})
 
--- ── main ─────────────────────────────────────
-local apGroup     = mainTab:AddLeftGroupbox( "APGroup",     {Text="auto player"    })
-local playerGroup = mainTab:AddLeftGroupbox( "PlayerGroup", {Text="player settings"})
-local chanceGroup = mainTab:AddRightGroupbox("ChanceGroup", {Text="hit chances"    })
+-- ── play ─────────────────────────────────────────────────────
+local pL = playTab:AddLeftGroupbox( "PL", {Text="auto player"  })
+local pR = playTab:AddRightGroupbox("PR", {Text="legit options" })
 
-apGroup:AddToggle("AutoPlayerEnabled", {
+pL:AddToggle("Enable",{
     Text="enable", Value=false,
-    Tooltip="turns the auto player on or off",
+    Tooltip="start or stop the auto player",
     Callback=function(val)
         v8=val
         if v8 then
@@ -547,7 +508,7 @@ apGroup:AddToggle("AutoPlayerEnabled", {
             for i=1,4 do vimUp(i) end
             seenNotes={}; startLoop()
             if autoLatency then startAutoLatency() end
-            window:Notification({Title="auto player", Text="turned <font color='#5BC8F5'><b>on</b></font>", Duration=2})
+            window:Notification({Title="autoplay",Text="<font color='#5BC8F5'><b>on</b></font>",Duration=2})
         else
             for i=1,4 do
                 if laneHoldFrame[i] then stopHold(i,false) end
@@ -557,48 +518,43 @@ apGroup:AddToggle("AutoPlayerEnabled", {
             stopAutoLatency()
             laneHoldFrame={nil,nil,nil,nil}; lanePressed={false,false,false,false}
             seenNotes={}
-            window:Notification({Title="auto player", Text="turned <font color='#F5A623'><b>off</b></font>", Duration=2})
+            window:Notification({Title="autoplay",Text="off",Duration=2})
         end
     end,
 })
 
-apGroup:AddToggle("Perfected", {
+pL:AddToggle("Perfected",{
     Text="perfected", Value=false,
-    Tooltip="uses renderstep instead of heartbeat — gives the most accurate timing",
+    Tooltip="uses renderstep — most accurate timing, closest to 0ms",
     Callback=function(val)
         perfected=val
         if val then minReaction=0; maxReaction=0 end
         if v8 then if mainLoop then mainLoop:Disconnect(); mainLoop=nil end; startLoop() end
-        window:Notification({Title="perfected", Text=val and "<font color='#5BC8F5'>on</font>" or "<font color='#F5A623'>off</font>", Duration=2})
+        window:Notification({Title="perfected",Text=val and "<font color='#5BC8F5'>on</font>" or "off",Duration=2})
     end,
 })
 
-apGroup:AddToggle("TileLights", {
+pL:AddToggle("TileLights",{
     Text="tile lights", Value=false,
-    Tooltip="lights up the mobile buttons when a note is pressed — purely visual",
+    Tooltip="lights up the mobile receptor tiles on keypress",
     Callback=function(val)
         tileLights=val
         if not val then
-            for lane=1,4 do
-                local tile=getMobileTile(lane)
-                if tile then tile.ImageTransparency=0.8 end
-            end
+            for i=1,4 do local t=getMobileTile(i); if t then t.ImageTransparency=0.8 end end
         end
-        window:Notification({Title="tile lights", Text=val and "<font color='#5BC8F5'>on</font>" or "<font color='#F5A623'>off</font>", Duration=2})
+        window:Notification({Title="tile lights",Text=val and "<font color='#5BC8F5'>on</font>" or "off",Duration=2})
     end,
 })
 
-apGroup:AddToggle("MissJacks", {
+pL:AddToggle("MissJacks",{
     Text="miss jack notes", Value=false,
-    Tooltip="skips fast repeated notes on the same key to look more human",
+    Tooltip="skips fast repeated notes on the same key",
     Callback=function(val) missJacks=val end,
 })
 
-apGroup:AddSeparator("AS_legit",{})
-
-apGroup:AddToggle("LegitMode", {
+pR:AddToggle("LegitMode",{
     Text="legit mode", Value=false,
-    Tooltip="caps your kps and mixes in sicks/goods to look like a real player",
+    Tooltip="mixes in sicks/goods and caps kps to look human",
     Callback=function(val)
         legitMode=val
         if val then
@@ -606,107 +562,106 @@ apGroup:AddToggle("LegitMode", {
         else
             perfectChance=100; sickChance=0; goodChance=0; okChance=0; badChance=0; missChance=0
         end
-        window:Notification({Title="legit mode", Text=val and "on — kps cap: <b>"..legitKpsLimit.."</b>" or "off", Duration=2})
+        window:Notification({Title="legit mode",Text=val and "<font color='#5BC8F5'>on</font>" or "off",Duration=2})
     end,
 })
 
-apGroup:AddSlider("LegitKps", {
+pR:AddSlider("LegitKps",{
     Text="kps limit", Min=1, Max=100, Value=100, Step=1,
-    Tooltip="max keypresses per second when legit mode is on",
-    Callback=function(val) legitKpsLimit=val end,
+    Tooltip="max keypresses per second in legit mode",
+    Callback=function(v) legitKpsLimit=v end,
 })
 
--- ── player settings ───────────────────────────
-playerGroup:AddToggle("AutoLatency", {
+pR:AddSeparator("PRS1",{})
+
+pR:AddSlider("MinReaction",{
+    Text="min reaction (ms)", Min=0, Max=200, Value=0, Step=1,
+    Tooltip="minimum artificial delay. ignored when perfected is on",
+    Callback=function(v) if not perfected then minReaction=v end end,
+})
+pR:AddSlider("MaxReaction",{
+    Text="max reaction (ms)", Min=0, Max=200, Value=0, Step=1,
+    Tooltip="maximum artificial delay. ignored when perfected is on",
+    Callback=function(v) if not perfected then maxReaction=v end end,
+})
+
+-- ── tune ─────────────────────────────────────────────────────
+local tL = tuneTab:AddLeftGroupbox( "TL", {Text="latency"    })
+local tR = tuneTab:AddRightGroupbox("TR", {Text="hit chances" })
+
+tL:AddToggle("AutoLatency",{
     Text="auto latency", Value=true,
-    Tooltip="reads the ms counter and auto-tunes the timing. starts fast, slows down once it finds the sweet spot.",
+    Tooltip="reads the ms counter and self-tunes. hunt → locked. locked is near-frozen and re-hunts if timing drifts.",
     Callback=function(val)
         autoLatency=val
-        if val and v8 then startAutoLatency()
-        elseif not val then stopAutoLatency() end
+        if val and v8 then startAutoLatency() elseif not val then stopAutoLatency() end
         window:Notification({
             Title="auto latency",
-            Text=val and "<font color='#5BC8F5'>on</font> — tuning itself" or "<font color='#F5A623'>off</font> — using manual slider",
+            Text=val and "<font color='#5BC8F5'>on</font> — self-tuning" or "off — manual slider",
             Duration=3
         })
     end,
 })
 
-playerGroup:AddLabel("ALInfo", {
-    Text="<font color='#888'>if auto latency is off:\nms shows + → raise slider\nms shows - → lower slider</font>"
-})
+tL:AddLabel("TLH",{Text="<font color='#888'>manual (auto latency off):\nms shows + → raise  ·  ms shows - → lower</font>"})
 
-playerGroup:AddSlider("VimLatency", {
+tL:AddSlider("VimLatency",{
     Text="vim latency (ms)", Min=0, Max=300, Value=103, Step=1,
-    Tooltip="only matters when auto latency is off",
-    Callback=function(val) if not autoLatency then vimLatencyMs=math.floor(val) end end,
+    Tooltip="only used when auto latency is off",
+    Callback=function(v) if not autoLatency then vimLatencyMs=v end end,
 })
 
-playerGroup:AddSeparator("PS1",{})
+tR:AddLabel("TRH",{Text="<font color='#F5A623'><b>weights, not percentages.</b></font>\nall 0 = always perfect.\nlocked while legit mode is on."})
+tR:AddSeparator("TRS",{})
+tR:AddSlider("PC",{Text="perfect",Min=0,Max=100,Value=100,Step=1,Callback=function(v) if not legitMode then perfectChance=v end end})
+tR:AddSlider("SC",{Text="sick",   Min=0,Max=100,Value=0,  Step=1,Tooltip="+45ms",  Callback=function(v) if not legitMode then sickChance=v end end})
+tR:AddSlider("GC",{Text="good",   Min=0,Max=100,Value=0,  Step=1,Tooltip="+75ms",  Callback=function(v) if not legitMode then goodChance=v end end})
+tR:AddSlider("OC",{Text="ok",     Min=0,Max=100,Value=0,  Step=1,Tooltip="+125ms", Callback=function(v) if not legitMode then okChance=v end end})
+tR:AddSlider("BC",{Text="bad",    Min=0,Max=100,Value=0,  Step=1,Tooltip="+175ms", Callback=function(v) if not legitMode then badChance=v end end})
+tR:AddSlider("MC",{Text="miss",   Min=0,Max=100,Value=0,  Step=1,                  Callback=function(v) if not legitMode then missChance=v end end})
 
-playerGroup:AddSlider("MinReaction", {
-    Text="min reaction (ms)", Min=0, Max=150, Value=0, Step=1,
-    Tooltip="ignored when perfected is on",
-    Callback=function(val) if not perfected then minReaction=math.floor(val) end end,
-})
+-- ── misc ─────────────────────────────────────────────────────
+local mG = miscTab:AddLeftGroupbox("MG",{Text="platform display"})
 
-playerGroup:AddSlider("MaxReaction", {
-    Text="max reaction (ms)", Min=0, Max=150, Value=0, Step=1,
-    Tooltip="ignored when perfected is on",
-    Callback=function(val) if not perfected then maxReaction=math.floor(val) end end,
-})
-
--- ── hit chances ───────────────────────────────
-chanceGroup:AddLabel("CI",{Text="<font color='#F5A623'><b>weights, not percentages</b></font>\nall 0 = always perfect.\nlocked while legit mode is on."})
-chanceGroup:AddSeparator("CS",{})
-chanceGroup:AddSlider("PerfectChance",{Text="perfect",Min=0,Max=100,Value=100,Step=1,Callback=function(v) if not legitMode then perfectChance=math.floor(v) end end})
-chanceGroup:AddSlider("SickChance",   {Text="sick",   Min=0,Max=100,Value=0,  Step=1,Tooltip="+45ms",  Callback=function(v) if not legitMode then sickChance=math.floor(v) end end})
-chanceGroup:AddSlider("GoodChance",   {Text="good",   Min=0,Max=100,Value=0,  Step=1,Tooltip="+75ms",  Callback=function(v) if not legitMode then goodChance=math.floor(v) end end})
-chanceGroup:AddSlider("OkChance",     {Text="ok",     Min=0,Max=100,Value=0,  Step=1,Tooltip="+125ms", Callback=function(v) if not legitMode then okChance=math.floor(v) end end})
-chanceGroup:AddSlider("BadChance",    {Text="bad",    Min=0,Max=100,Value=0,  Step=1,Tooltip="+175ms", Callback=function(v) if not legitMode then badChance=math.floor(v) end end})
-chanceGroup:AddSlider("MissChance",   {Text="miss",   Min=0,Max=100,Value=0,  Step=1,               Callback=function(v) if not legitMode then missChance=math.floor(v) end end})
-
--- ── misc ─────────────────────────────────────
-local miscGroup = miscTab:AddLeftGroupbox("MiscGroup", {Text="platform display"})
-
-miscGroup:AddToggle("PlatformAutoRejoin", {
+mG:AddToggle("PAR",{
     Text="auto rejoin after applying", Value=true,
-    Callback=function(val) platformAutoRejoin=val end,
+    Callback=function(v) platformAutoRejoin=v end,
 })
-miscGroup:AddTextBox("PlatformContent", {
-    Text="display content", Value="😇", PlaceholderText="type text or emoji...",
-    Callback=function(val) if val and val~="" then platformContent=val end end,
+mG:AddTextBox("PC2",{
+    Text="display content", Value="😇", PlaceholderText="text or emoji...",
+    Callback=function(v) if v and v~="" then platformContent=v end end,
 })
-miscGroup:AddButton("ApplyPlatform", {
+mG:AddButton("APB",{
     Text="apply platform display",
     Callback=function()
-        if game.PlaceId ~= 6520999642 then
-            window:Notification({Title="error",Text="wrong game!",Duration=3}); return
+        if game.PlaceId~=6520999642 then
+            window:Notification({Title="error",Text="wrong game",Duration=3}); return
         end
-        if not (isfile and readfile and writefile) then
+        if not(isfile and readfile and writefile) then
             window:Notification({Title="error",Text="executor not supported",Duration=3}); return
         end
-        local QueueOnTP = (syn and syn.queue_on_teleport)
+        local Q=(syn and syn.queue_on_teleport)
             or (fluxus and fluxus.queue_on_teleport)
             or (queue_on_teleport and queue_on_teleport)
-        if not QueueOnTP then
+        if not Q then
             window:Notification({Title="error",Text="missing queue_on_teleport",Duration=3}); return
         end
-        local Content=platformContent
-        writefile("FNFRemixDisplayContent.txt", tostring(Content))
-        local SG=game:GetService("StarterGui"); local P=game:GetService("Players")
-        local TPS=game:GetService("TeleportService"); local Spk=P.LocalPlayer
+        local C=platformContent
+        writefile("FNFRemixDisplayContent.txt",tostring(C))
+        local SG=game:GetService("StarterGui")
+        local P=game:GetService("Players")
+        local TPS=game:GetService("TeleportService")
+        local Spk=P.LocalPlayer
         local function Alert()
             local s=Instance.new("Sound",game:GetService("SoundService"))
             s.Volume=2; s.SoundId="rbxassetid://4590662766"; s.PlayOnRemove=true; s:Destroy()
         end
         if _G.FNFRemixACPD or (getgenv and getgenv().FNFRemixACPD) then
-            SG:SetCore("SendNotification",{Title="🧐 changed!",Text="display: '"..Content.."'",Duration=5})
-            window:Notification({Title="platform",Text="content: "..Content,Duration=4})
+            SG:SetCore("SendNotification",{Title="🧐 changed!",Text="'"..C.."'",Duration=5})
             Alert(); return
         end
-        local Rejoin=Instance.new("BindableFunction")
-        Rejoin.OnInvoke=function(Ans)
+        local Rej=Instance.new("BindableFunction")
+        Rej.OnInvoke=function(Ans)
             if Ans=="Yes" and platformAutoRejoin then
                 if #P:GetPlayers()<=1 then
                     Spk:Kick("\nrejoining..."); task.wait(); TPS:Teleport(6520999642,Spk)
@@ -715,40 +670,28 @@ miscGroup:AddButton("ApplyPlatform", {
                 end
             end
         end
-        QueueOnTP([[
+        Q([[
             if game.PlaceId~=6520999642 then return end
             if not(isfile and readfile) then return end
-            local Content=(isfile('FNFRemixDisplayContent.txt') and readfile('FNFRemixDisplayContent.txt')) or '😇'
-            local Speaker=game:GetService'Players'.LocalPlayer
+            local C=(isfile('FNFRemixDisplayContent.txt') and readfile('FNFRemixDisplayContent.txt')) or '😇'
+            local Spk=game:GetService'Players'.LocalPlayer
             task.spawn(function()
-                local conn
-                conn=Speaker:WaitForChild'PlayerScripts'.ChildAdded:Connect(function(Child)
-                    if Child:IsA'LocalScript' and Child.Name=='PlatformDisplay' then
-                        Child.Disabled=true; conn:Disconnect()
+                local cn
+                cn=Spk:WaitForChild'PlayerScripts'.ChildAdded:Connect(function(ch)
+                    if ch:IsA'LocalScript' and ch.Name=='PlatformDisplay' then
+                        ch.Disabled=true; cn:Disconnect()
                     end
                 end)
             end)
-            game:GetService'ReplicatedStorage':WaitForChild'Remotes':WaitForChild'PlatformRemoteEvent':FireServer(tostring(Content))
+            game:GetService'ReplicatedStorage':WaitForChild'Remotes':WaitForChild'PlatformRemoteEvent':FireServer(tostring(C))
         ]])
         SG:SetCore("SendNotification",{
             Title=platformAutoRejoin and "🧐 rejoin?" or "🧐 done",
-            Text=platformAutoRejoin and "rejoin to apply '"..Content.."'?" or "rejoin manually.",
-            Button1="Yes",Button2="No",Duration=(1/0),Callback=Rejoin,
+            Text=platformAutoRejoin and "rejoin to apply '"..C.."'?" or "rejoin manually.",
+            Button1="Yes",Button2="No",Duration=(1/0),Callback=Rej,
         })
         Alert()
-        window:Notification({Title="platform",Text="set: "..Content,Duration=4})
+        window:Notification({Title="platform",Text="set: "..C,Duration=4})
         if getgenv then getgenv().FNFRemixACPD=true else _G.FNFRemixACPD=true end
     end,
-})
-
--- ── settings ─────────────────────────────────
-local themeGroup = settingsTab:AddLeftGroupbox("ThemeGroup", {Text="theme"})
-
-themeGroup:AddLabel("TL1",{Text="<font color='#5BC8F5'><b>accent color</b></font> (default: #5BC8F5)"}):AddColorPicker("ThemeMain",{
-    Value=C_BLUE,
-    Callback=function(val) window.Theme={Back=C_BG,Main=val,Stroke=C_ORANGE,Text=C_WHITE}; window:Refresh() end,
-})
-themeGroup:AddLabel("TL2",{Text="<font color='#F5A623'><b>stroke color</b></font> (default: #F5A623)"}):AddColorPicker("ThemeStroke",{
-    Value=C_ORANGE,
-    Callback=function(val) window.Theme={Back=C_BG,Main=C_BLUE,Stroke=val,Text=C_WHITE}; window:Refresh() end,
 })
