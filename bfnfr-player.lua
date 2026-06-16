@@ -59,14 +59,14 @@ local v5           = Players.LocalPlayer
 -- perfect window:  |scale| <= 0.71775 * spd
 -- trigger formula: (0.71775 - latMs/1000 * 5.5) * spd
 --
--- auto latency — two phases:
---   hunt:   sample every 0.25s, PI correction, converges fast
---   locked: sample every 0.8s, micro-nudge only (±0.3ms max)
---           only re-hunts if sustained drift > 5ms for 6+ samples
---           vimLatencyMs is essentially frozen once locked
---
--- stale-reading guard: skip samples where msIndic text hasn't
--- changed in the last 0.4s (no notes hit = stale value)
+-- auto latency — pure proportional controller, median-based:
+--   NO integral term (that was causing overshoot/oscillation)
+--   uses MEDIAN of last 8 readings (immune to hold/miss outliers)
+--   hunt:   sample every fresh text change, correct by median * GAIN
+--           locks after 10 consecutive samples where |median| <= 2ms
+--   locked: sample every 1s, correct by median * 0.03 (near-frozen)
+--           re-hunts only if |median| > 5ms for 8 consecutive samples
+--   stale guard: skip if msIndic text unchanged in last 0.35s
 -- ════════════════════════════════════════════════════════════
 local vimLatencyMs    = 103
 local autoLatency     = true
@@ -74,37 +74,35 @@ local autoLatencyConn = nil
 local alSongWatcher   = nil
 local alPhase         = "hunt"
 
--- hunt PI gains
-local P_GAIN        = 0.20    -- proportional
-local I_GAIN        = 0.015   -- integral (slowly removes residual error)
-local I_CLAMP       = 20      -- max integral accumulation (ms)
--- locked micro-nudge
-local LOCK_NUDGE    = 0.3     -- max ms change per locked sample
--- thresholds
-local LOCK_THRESH   = 2.5     -- ms: avg error below this = good
-local LOCK_N        = 12      -- consecutive good samples → lock
-local UNLOCK_THRESH = 6       -- ms: avg error above this = bad (when locked)
-local UNLOCK_N      = 7       -- consecutive bad samples → re-hunt
-local HUNT_INTERVAL = 0.25
-local LOCK_INTERVAL = 0.8
-local OUTLIER_MAX   = 40      -- ms: ignore (holds/misses contaminate buffer)
-local BUF_SIZE      = 12
+local HUNT_GAIN     = 0.30   -- fraction of median error to correct per sample
+local LOCK_GAIN     = 0.03   -- near-frozen correction when locked
+local LOCK_THRESH   = 2.0    -- ms: |median| below this = good sample
+local LOCK_N        = 10     -- consecutive good samples → lock
+local UNLOCK_THRESH = 5.0    -- ms: |median| above this when locked = bad
+local UNLOCK_N      = 8      -- consecutive bad samples → re-hunt
+local HUNT_INTERVAL = 0.15   -- min seconds between hunt samples
+local LOCK_INTERVAL = 1.0    -- seconds between locked samples
+local STALE_MAX     = 0.35   -- ms indicator must have changed within this
+local BUF_SIZE      = 8      -- median buffer size (odd = clean median)
 
-local alBuf         = {}
-local alGoodN       = 0
-local alBadN        = 0
-local alIntegral    = 0
+local alBuf          = {}
+local alGoodN        = 0
+local alBadN         = 0
 local alSavedHitLate = false
 
 local function alReset(phase)
-    alBuf={}; alGoodN=0; alBadN=0; alIntegral=0
+    alBuf={}; alGoodN=0; alBadN=0
     alPhase = phase or "hunt"
 end
 
-local function alAvg()
+local function alMedian()
     if #alBuf == 0 then return 0 end
-    local s=0; for _,v in ipairs(alBuf) do s=s+v end
-    return s/#alBuf
+    local s = {}
+    for _,v in ipairs(alBuf) do s[#s+1]=v end
+    table.sort(s)
+    local n = #s
+    if n%2==1 then return s[math.ceil(n/2)]
+    else return (s[n/2] + s[n/2+1]) / 2 end
 end
 
 local function calcTriggerScale(spd)
@@ -136,7 +134,6 @@ local function startAutoLatency()
         local now = tick()
         local interval = (alPhase=="hunt") and HUNT_INTERVAL or LOCK_INTERVAL
         if now - lastSample < interval then return end
-        lastSample = now
 
         local mf = v5.PlayerGui:FindFirstChild("Main")
                and v5.PlayerGui.Main:FindFirstChild("MatchFrame")
@@ -145,41 +142,51 @@ local function startAutoLatency()
         if not (ind and ind.Visible) then return end
 
         local txt = ind.Text or ""
-        if txt ~= lastText then lastText=txt; lastTextTime=now end
-        if now - lastTextTime > 0.4 then return end   -- stale, skip
+        -- only accept readings that are freshly updated (note was just hit)
+        if txt ~= lastText then
+            lastText = txt
+            lastTextTime = now
+        else
+            if now - lastTextTime > STALE_MAX then return end
+        end
+
+        -- only sample after the interval has passed AND text is fresh
+        if now - lastSample < interval then return end
+        lastSample = now
 
         local val = tonumber(txt:match("(-?%d+%.?%d*)"))
-        if not val or math.abs(val) > OUTLIER_MAX then return end
+        -- tight outlier window: holds/misses produce large values we ignore
+        if not val or math.abs(val) > 35 then return end
 
         table.insert(alBuf, val)
-        if #alBuf > BUF_SIZE then table.remove(alBuf,1) end
-        local avg = alAvg()
+        if #alBuf > BUF_SIZE then table.remove(alBuf, 1) end
+        if #alBuf < 3 then return end  -- need at least 3 samples for stable median
+
+        local med = alMedian()
 
         if alPhase == "hunt" then
-            alIntegral = math.clamp(alIntegral + avg*I_GAIN, -I_CLAMP, I_CLAMP)
-            local corr = avg*P_GAIN + alIntegral
-            vimLatencyMs = math.clamp(vimLatencyMs + corr, 0, 300)
+            -- pure proportional: correct by a fraction of the median error
+            -- no integral = no overshoot, converges smoothly to 0
+            vimLatencyMs = math.clamp(vimLatencyMs + med * HUNT_GAIN, 0, 300)
 
-            if math.abs(avg) <= LOCK_THRESH then
-                alGoodN=alGoodN+1; alBadN=0
+            if math.abs(med) <= LOCK_THRESH then
+                alGoodN = alGoodN+1; alBadN = 0
                 if alGoodN >= LOCK_N then
-                    alPhase="locked"; alGoodN=0; alBadN=0; alBuf={}
-                    alIntegral = alIntegral * 0.3  -- bleed off most integral on lock
+                    alPhase = "locked"
+                    alGoodN = 0; alBadN = 0; alBuf = {}
                 end
             else
-                alBadN=alBadN+1; alGoodN=0
+                alBadN = alBadN+1; alGoodN = 0
             end
 
-        else  -- locked: micro-nudge only, strong hysteresis before re-hunting
-            -- tiny correction capped at LOCK_NUDGE ms per sample
-            local nudge = math.clamp(avg * 0.08, -LOCK_NUDGE, LOCK_NUDGE)
-            vimLatencyMs = math.clamp(vimLatencyMs + nudge, 0, 300)
+        else  -- locked: near-frozen, only tiny drift correction
+            vimLatencyMs = math.clamp(vimLatencyMs + med * LOCK_GAIN, 0, 300)
 
-            if math.abs(avg) > UNLOCK_THRESH then
-                alBadN=alBadN+1; alGoodN=0
+            if math.abs(med) > UNLOCK_THRESH then
+                alBadN = alBadN+1; alGoodN = 0
                 if alBadN >= UNLOCK_N then alReset("hunt") end
             else
-                alBadN=0; alGoodN=alGoodN+1
+                alBadN = 0; alGoodN = alGoodN+1
             end
         end
     end)
@@ -471,10 +478,10 @@ end
 -- ════════════════════════════════════════════════════════════
 -- ui — NullFire-inspired clean layout
 -- ════════════════════════════════════════════════════════════
-local infoTab  = window:AddTab("InfoTab",  {Text="📖 info"   })
-local playTab  = window:AddTab("PlayTab",  {Text="⚡ play"   })
-local tuneTab  = window:AddTab("TuneTab",  {Text="🎯 tune"   })
-local miscTab  = window:AddTab("MiscTab",  {Text="🎭 misc"   })
+local infoTab  = window:AddTab("InfoTab",  {Text="ℹ info"   })
+local playTab  = window:AddTab("PlayTab",  {Text="▶ play"   })
+local tuneTab  = window:AddTab("TuneTab",  {Text="◈ tune"   })
+local miscTab  = window:AddTab("MiscTab",  {Text="✦ misc"   })
 
 -- ── info ─────────────────────────────────────────────────────
 local iL = infoTab:AddLeftGroupbox("IL",  {Text="about"       })
