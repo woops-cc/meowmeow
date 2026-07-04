@@ -68,7 +68,7 @@ local v5           = Players.LocalPlayer
 --           re-hunts only if |median| > 5ms for 8 consecutive samples
 --   stale guard: skip if msIndic text unchanged in last 0.35s
 -- ════════════════════════════════════════════════════════════
-local vimLatencyMs    = 103
+local vimLatencyMs    = 111
 local autoLatency     = true
 local autoLatencyConn = nil
 local alSongWatcher   = nil
