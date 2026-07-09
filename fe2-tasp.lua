@@ -1,3 +1,4 @@
+-- original by TomatoTXT, optimized and added Auto Sync by woops
 local TimeModifier = 1 -- [CONTROL SPEED HERE] (1 = Normal, 0.5 = 2x Speed, 2 = Slow Motion)
 local SmoothnessFactor = 0.15 -- [ROTATION SMOOTHING] Lower = Smoother, Higher = Snappier (0.1-0.2 recommended)
 
