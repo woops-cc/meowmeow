@@ -1,6 +1,6 @@
 --[[
     FE2 TAS Creator — Mobile Edition
-    Original by tomatotxt | Mobile port with touch numpad by seandacat
+    Original by tomatotxt | Mobile port with touch numpad by seandacat and woops
     - All keybinds replaced with on-screen touch buttons
     - Buttons directly call functions (no keypress simulation)
     - Draggable numpad panel on right side of screen
