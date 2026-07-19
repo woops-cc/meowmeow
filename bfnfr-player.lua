@@ -1,6 +1,6 @@
 local lib = loadstring(game:HttpGet("https://raw.githubusercontent.com/Null-Cherry/Fire-Library/refs/heads/main/Loader.lua", true))()
 
--- ── palette (original oc colors) ──
+-- ── palette (ui colors or something like that) ──
 local C_BLUE   = Color3.fromRGB(91,  200, 245)   -- sky blue  #5BC8F5
 local C_ORANGE = Color3.fromRGB(245, 166, 35)    -- gold      #F5A623
 local C_BG     = Color3.fromRGB(18,  18,  22)    -- dark bg
@@ -54,13 +54,13 @@ local Players      = game:GetService("Players")
 local v5           = Players.LocalPlayer
 
 -- ════════════════════════════════════════════════════════════
--- timing & auto latency
+-- timing & auto latency details + whatever else
 -- ────────────────────────────────────────────────────────────
 -- perfect window:  |scale| <= 0.71775 * spd
 -- trigger formula: (0.71775 - latMs/1000 * 5.5) * spd
 --
--- auto latency — pure proportional controller, median-based:
---   NO integral term (that was causing overshoot/oscillation)
+-- auto latency ( pure proportional controller, median-based ):
+--   NO integral term (when i tested it was causing overshooting and stuffs)
 --   uses MEDIAN of last 8 readings (immune to hold/miss outliers)
 --   hunt:   sample every fresh text change, correct by median * GAIN
 --           locks after 10 consecutive samples where |median| <= 2ms
@@ -142,7 +142,7 @@ local function startAutoLatency()
         if not (ind and ind.Visible) then return end
 
         local txt = ind.Text or ""
-        -- only accept readings that are freshly updated (note was just hit)
+        -- only accept readings that are freshly updated ( AKA note was just hit )
         if txt ~= lastText then
             lastText = txt
             lastTextTime = now
@@ -200,7 +200,7 @@ local function stopAutoLatency()
 end
 
 -- ════════════════════════════════════════════════════════════
--- keybinds & state
+-- keybinds & state (ill soon js make it automatically get the keys since im lowk lazy and tarded asf)
 -- ════════════════════════════════════════════════════════════
 local KEYS        = {Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.W, Enum.KeyCode.D}
 local TAP_DUR     = 0.05
@@ -230,7 +230,7 @@ local platformAutoRejoin = true
 local kpsLog = {}
 
 -- ════════════════════════════════════════════════════════════
--- tile lighting
+-- tile lighting thingy for legitimacy and stuffs 😇😇
 -- path: MatchFrame.MobileKeys.Left/Down/Up/Right
 -- press → transparency 0, release → tween to 0.8
 -- ════════════════════════════════════════════════════════════
@@ -288,7 +288,7 @@ end
 --   v98 = max(0, p88-0.07), clamped 0 if <=0.03
 --   Size.Y.Scale = v98 * 5.5 * spd  (negative in upscroll)
 --   → p88 = |scale|/(5.5*spd) + 0.07
--- we pressed vimLatencyMs early, so hold for p88 - latency_sec
+-- lowk pressed vimLatencyMs early, so hold for p88 - latency_sec
 -- ════════════════════════════════════════════════════════════
 local function resetLnHold(lane)
     pcall(function()
@@ -360,7 +360,7 @@ local function getMyKeySync()
 end
 
 -- ════════════════════════════════════════════════════════════
--- note handler
+-- note handler !!!
 -- ════════════════════════════════════════════════════════════
 local function handleNote(lane, isHold, holdFrame, arrowFrame, sync, spd)
     if not canPress() then return end
@@ -419,13 +419,13 @@ local function startLoop()
         local KS = getMyKeySync()
         if not (KS and KS.Visible) then return end
 
-        -- sv: re-read speed every frame (handles mid-song sv changes)
+        -- sv: re-read speed every frame (which SHOULD handle mid-song sv changes)
         local spd = math.clamp(
             tonumber((_G and _G.Settings and _G.Settings.NoteSpeed) or 2) or 2,
             0.5, 10)
         local trigger  = calcTriggerScale(spd)
-        -- rescue window: catch notes that slipped past trigger during lag spikes
-        -- capped at half the perfect window so we don't fire too early
+        -- this is what i call the RESCUE WINDOW, it catches notes that slipped past trigger during lag spikes
+        -- capped at half the perfect window so we don't fire too early (i havent tested this at all btw)
         local rescue   = math.min(trigger * 1.8, 0.71775 * spd)
 
         for lane=1,4 do
@@ -476,7 +476,7 @@ local function startLoop()
 end
 
 -- ════════════════════════════════════════════════════════════
--- ui — NullFire-inspired clean layout
+-- ui which looks amazing btw
 -- ════════════════════════════════════════════════════════════
 local infoTab  = window:AddTab("InfoTab",  {Text="ℹ info"   })
 local playTab  = window:AddTab("PlayTab",  {Text="▶ play"   })
@@ -592,7 +592,7 @@ pR:AddSlider("MaxReaction",{
     Callback=function(v) if not perfected then maxReaction=v end end,
 })
 
--- ── tune ─────────────────────────────────────────────────────
+-- ── tune/ing ─────────────────────────────────────────────────────
 local tL = tuneTab:AddLeftGroupbox( "TL", {Text="latency"    })
 local tR = tuneTab:AddRightGroupbox("TR", {Text="hit chances" })
 
@@ -627,7 +627,7 @@ tR:AddSlider("OC",{Text="ok",     Min=0,Max=100,Value=0,  Step=1,Tooltip="+125ms
 tR:AddSlider("BC",{Text="bad",    Min=0,Max=100,Value=0,  Step=1,Tooltip="+175ms", Callback=function(v) if not legitMode then badChance=v end end})
 tR:AddSlider("MC",{Text="miss",   Min=0,Max=100,Value=0,  Step=1,                  Callback=function(v) if not legitMode then missChance=v end end})
 
--- ── misc ─────────────────────────────────────────────────────
+-- ── miscellaneous which is like entirely empty rn (soon..) ─────────────────────────────────────────────────────
 local mG = miscTab:AddLeftGroupbox("MG",{Text="platform display"})
 
 mG:AddToggle("PAR",{
