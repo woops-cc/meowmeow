@@ -27,7 +27,7 @@ local Keybinds = {
     Resync = "F8",
     EnvPause = "Equals",
     DebugToggler = "V",
-    AutoSwimToggler = "T" -- Added Auto-Swim toggle keybind (T)
+    AutoSwimToggler = "T" -- added Auto-Swim toggle keybind (T)
 }
 
 -- // SERVICES //
@@ -146,8 +146,8 @@ local PathLines = {}
 local SelectedFileToLoad = ""
 
 -- // FILE PLAYBACK STATE //
--- Used by the original 0-key TAS preview. File editing/loading is handled
--- separately below so loading a saved TAS never requires playing it through.
+-- ok so how it work s its used by the original 0-key TAS preview so file editing/loading is handled
+-- separately below so loading a saved TAS never requires playing it through, yay
 local PlaybackState = {
     Active = false,
     Paused = false,
@@ -160,9 +160,9 @@ local PlaybackState = {
 local ActivateTASAnimation
 
 -- // PRELOADED FILE EDITOR //
--- A selected JSON file is decoded into memory immediately, so Load Selected Run
--- never has to play through the TAS first. Timestamp seeking is non-destructive
--- until the user resumes recording; then everything after the seek point is cut.
+-- a selected json file is decoded into memory immediately, so load selected run
+-- never has to play through the TAS first so timestamp seeking is non-destructive or wtv
+-- until the user resumes recording, then everything after the seek point is cut
 local PreloadedTASData = nil
 local PreloadedTASFilename = ""
 local LoadedFileMode = false
