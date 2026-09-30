@@ -1,10 +1,10 @@
 local lib = loadstring(game:HttpGet("https://raw.githubusercontent.com/Null-Cherry/Fire-Library/refs/heads/main/Loader.lua", true))()
 
 -- ── palette (galaxy collapse my beloved: crimson, ink black & white) ──
-local C_RED   = Color3.fromRGB(196, 30,  58)     -- crimson   #C41E3A
-local C_STEEL = Color3.fromRGB(208, 208, 214)    -- pale grey #D0D0D6
-local C_BG    = Color3.fromRGB(10,  10,  12)     -- near-black bg
-local C_WHITE = Color3.fromRGB(232, 232, 236)    -- soft white text
+local C_RED   = Color3.fromRGB(196, 30,  58)     -- #C41E3A
+local C_STEEL = Color3.fromRGB(208, 208, 214)    -- #D0D0D6
+local C_BG    = Color3.fromRGB(10,  10,  12)     -- supposed to be near black
+local C_WHITE = Color3.fromRGB(232, 232, 236)    -- white text
 
 local window = lib:Window("bfnfr_ap", {
     Title    = "<font color='#E8E8EC'><b>fnf:r</b></font><font color='#C41E3A'> botplay</font>",
