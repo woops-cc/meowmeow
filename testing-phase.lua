@@ -1,15 +1,15 @@
 local lib = loadstring(game:HttpGet("https://raw.githubusercontent.com/Null-Cherry/Fire-Library/refs/heads/main/Loader.lua", true))()
 
--- ── palette (galaxy collapse my beloved: crimson, ink black & white) ──
-local C_RED   = Color3.fromRGB(196, 30,  58)     -- #C41E3A
-local C_STEEL = Color3.fromRGB(208, 208, 214)    -- #D0D0D6
-local C_BG    = Color3.fromRGB(10,  10,  12)     -- supposed to be near black
-local C_WHITE = Color3.fromRGB(232, 232, 236)    -- white text
+-- ── palette (galaxy collapse — crimson, ink black & white) ──
+local C_RED   = Color3.fromRGB(196, 30,  58)     -- crimson   #C41E3A
+local C_STEEL = Color3.fromRGB(208, 208, 214)    -- pale grey #D0D0D6
+local C_BG    = Color3.fromRGB(10,  10,  12)     -- near-black bg
+local C_WHITE = Color3.fromRGB(232, 232, 236)    -- soft white text
 
 local window = lib:Window("bfnfr_ap", {
     Title    = "<font color='#E8E8EC'><b>fnf:r</b></font><font color='#C41E3A'> botplay</font>",
     Icon     = "125411711221424",
-    Footer   = "<font color='#C41E3A'>woops <3</font>  ·  basically fnf: remix",
+    Footer   = "<font color='#C41E3A'>woops &lt;3</font>  ·  basically fnf: remix",
     Keybind  = Enum.KeyCode.RightShift,
     NeonType      = "Top",
     NeonThickness = 3,
@@ -484,7 +484,7 @@ local tuneTab  = window:AddTab("TuneTab",  {Text="◈ tune"   })
 local iL = infoTab:AddLeftGroupbox("IL",  {Text="about"       })
 local iR = infoTab:AddRightGroupbox("IR", {Text="feature list" })
 
-iL:AddLabel("IL1",{Text="<font color='#C41E3A'><b>fnf:r botplay</b></font> by woops <3\n\nplays basically fnf: remix for you, automatically.\nperfect mode hits every note right on time.\nauto latency figures out the right timing on its own after a few seconds."})
+iL:AddLabel("IL1",{Text="<font color='#C41E3A'><b>fnf:r botplay</b></font> by woops &lt;3\n\nplays basically fnf: remix for you, automatically.\nperfect mode hits every note right on time.\nauto latency figures out the right timing on its own after a few seconds."})
 iL:AddSeparator("ILS1",{})
 iL:AddLabel("IL2",{Text="<font color='#D0D0D6'><b>recommended setup:</b></font>\n• perfect mode → on\n• auto latency → on\n• all hit chances at 0 (always perfect)"})
 iL:AddSeparator("ILS2",{})
@@ -623,4 +623,3 @@ tR:AddSlider("GC",{Text="good",   Min=0,Max=100,Value=0,  Step=1,Tooltip="+75ms"
 tR:AddSlider("OC",{Text="ok",     Min=0,Max=100,Value=0,  Step=1,Tooltip="+125ms", Callback=function(v) if not legitMode then okChance=v end end})
 tR:AddSlider("BC",{Text="bad",    Min=0,Max=100,Value=0,  Step=1,Tooltip="+175ms", Callback=function(v) if not legitMode then badChance=v end end})
 tR:AddSlider("MC",{Text="miss",   Min=0,Max=100,Value=0,  Step=1,                  Callback=function(v) if not legitMode then missChance=v end end})
-
