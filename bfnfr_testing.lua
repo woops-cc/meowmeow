@@ -1,5 +1,7 @@
 local lib = loadstring(game:HttpGet("https://raw.githubusercontent.com/Null-Cherry/Fire-Library/refs/heads/main/Loader.lua", true))()
 
+local VERSION = "v3.0-beta"  -- reminder to self to bump this each update, shows in the footer
+
 -- ── palette (galaxy collapse — crimson, ink black & white) ──
 local C_RED   = Color3.fromRGB(196, 30,  58)     -- crimson   #C41E3A
 local C_STEEL = Color3.fromRGB(208, 208, 214)    -- pale grey #D0D0D6
@@ -7,9 +9,9 @@ local C_BG    = Color3.fromRGB(10,  10,  12)     -- near-black bg
 local C_WHITE = Color3.fromRGB(232, 232, 236)    -- soft white text
 
 local window = lib:Window("bfnfr_ap", {
-    Title    = "<font color='#E8E8EC'><b>fnf:r</b></font><font color='#C41E3A'> botplay</font>",
+    Title    = "<font color='#E8E8EC'><b>bfnf:r</b></font><font color='#C41E3A'> botplay</font>",
     Icon     = "125411711221424",
-    Footer   = "<font color='#C41E3A'>woops &lt;3</font>  ·  basically fnf: remix",
+    Footer   = "<font color='#C41E3A'>woops &lt;3</font>  ·  basically fnf: remix  ·  "..VERSION,
     Keybind  = Enum.KeyCode.RightShift,
     NeonType      = "Top",
     NeonThickness = 3,
@@ -59,14 +61,20 @@ local v5           = Players.LocalPlayer
 -- perfect window:  |scale| <= 0.71775 * spd
 -- trigger formula: (0.71775 - latMs/1000 * 5.5) * spd
 --
--- auto latency ( pure proportional controller, median-based ):
+-- auto latency ( proportional controller, median-based ):
 --   NO integral term (when i tested it was causing overshooting and stuffs)
 --   uses MEDIAN of last 8 readings (immune to hold/miss outliers)
---   hunt:   sample every fresh text change, correct by median * GAIN
+--   hunt:   sample every fresh text change, correct by median * adaptive gain
+--           (bigger errors correct faster, small ones correct gently so it
+--           settles instead of oscillating right near the target)
 --           locks after 10 consecutive samples where |median| <= 2ms
 --   locked: sample every 1s, correct by median * 0.03 (near-frozen)
 --           re-hunts only if |median| > 5ms for 8 consecutive samples
+--           outlier window tightens once locked (18ms vs 35ms while hunting)
 --   stale guard: skip if msIndic text unchanged in last 0.35s
+--   persists across songs: a lock is a device/input property, not a
+--   per-song one, so a new song only clears the sample buffer, never
+--   the lock itself — no more re-hunting from scratch every single song
 -- ════════════════════════════════════════════════════════════
 local vimLatencyMs    = 111
 local autoLatency     = true
@@ -74,7 +82,6 @@ local autoLatencyConn = nil
 local alSongWatcher   = nil
 local alPhase         = "hunt"
 
-local HUNT_GAIN     = 0.30   -- fraction of median error to correct per sample
 local LOCK_GAIN     = 0.03   -- near-frozen correction when locked
 local LOCK_THRESH   = 2.0    -- ms: |median| below this = good sample
 local LOCK_N        = 10     -- consecutive good samples → lock
@@ -93,6 +100,12 @@ local alSavedHitLate = false
 local function alReset(phase)
     alBuf={}; alGoodN=0; alBadN=0
     alPhase = phase or "hunt"
+end
+
+-- adaptive gain: bigger errors correct fast, small errors correct gently
+-- so it doesn't overshoot and oscillate right near the target
+local function huntGain(med)
+    return math.clamp(0.18 + math.abs(med)/120, 0.18, 0.45)
 end
 
 local function alMedian()
@@ -121,7 +134,13 @@ local function startAutoLatency()
         local mg = v5.PlayerGui:WaitForChild("Main", 30)
         if not mg then return end
         alSongWatcher = mg.ChildAdded:Connect(function(c)
-            if c.Name == "MatchFrame" then alReset("hunt") end
+            if c.Name ~= "MatchFrame" then return end
+            -- a locked calibration is a device/input property, not a per-song
+            -- one — re-hunting from scratch every song wasted the first few
+            -- seconds of every run. just drop the sample buffer (in case any
+            -- readings straddled the song boundary) and keep the lock.
+            alBuf = {}
+            if alPhase == "hunt" then alGoodN=0; alBadN=0 end
         end)
     end)
 
@@ -155,8 +174,11 @@ local function startAutoLatency()
         lastSample = now
 
         local val = tonumber(txt:match("(-?%d+%.?%d*)"))
-        -- tight outlier window: holds/misses produce large values we ignore
-        if not val or math.abs(val) > 35 then return end
+        -- outlier window: holds/misses produce large values we ignore.
+        -- tighter once locked, since anything wildly off at that point is
+        -- almost certainly a hold/miss artifact, not a real correction
+        local outlierMax = (alPhase=="locked") and 18 or 35
+        if not val or math.abs(val) > outlierMax then return end
 
         table.insert(alBuf, val)
         if #alBuf > BUF_SIZE then table.remove(alBuf, 1) end
@@ -165,9 +187,9 @@ local function startAutoLatency()
         local med = alMedian()
 
         if alPhase == "hunt" then
-            -- pure proportional: correct by a fraction of the median error
-            -- no integral = no overshoot, converges smoothly to 0
-            vimLatencyMs = math.clamp(vimLatencyMs + med * HUNT_GAIN, 0, 300)
+            -- proportional with adaptive gain: no integral term = no overshoot,
+            -- and the gain itself scales down as it nears the target
+            vimLatencyMs = math.clamp(vimLatencyMs + med * huntGain(med), 0, 300)
 
             if math.abs(med) <= LOCK_THRESH then
                 alGoodN = alGoodN+1; alBadN = 0
@@ -247,6 +269,21 @@ local lastScanResult       = nil     -- {totalSeconds=, noteCount=, spikes={ {t=
 local scanHookInstalled    = false
 local chartIsInSpikeWindow -- forward declared; defined down in the scanner section
 
+-- ════════ perfect mode: chart-exact scheduling ════════
+-- perfect mode represents an actual bot, so instead of reacting to note
+-- positions on screen (frame-rate and calibration dependent) it reads the
+-- same GetNotes1()/GetNotes2() chart data the scanner already grabs, and
+-- schedules every press at its real, exact timestamp. falls back to the
+-- old on-screen detection automatically if chart data isn't available.
+local chartSchedule       = {{},{},{},{}}  -- per lane: sorted {t=, hold=} for the current song
+local chartEpoch          = nil            -- tick() matching chart-time 0; nil = no chart data yet
+local activeSchedulerToken = nil           -- invalidates stale/old scheduled presses
+local buildChartSchedule  -- forward declared; defined down in the scanner section
+local startLoop           -- forward declared; defined further down, the main run loop
+
+-- ════════ mobile tiles: visual-only option ════════
+local blockManualTaps = false  -- tiles stay visible/lit but stop registering real taps
+
 -- ════════════════════════════════════════════════════════════
 -- tile lighting thingy for legitimacy and stuffs 😇😇
 -- path: MatchFrame.MobileKeys.Left/Down/Up/Right
@@ -276,6 +313,24 @@ local function lightTile(lane, lit)
     end
 end
 
+-- turns real touch input on/off for the on-screen tiles without touching
+-- how they look — so tile lights still work, but an accidental tap can't
+-- register as a press, miss, or bad rating anymore
+local function setTilesActive(active)
+    pcall(function()
+        local keys = v5.PlayerGui.Main.MatchFrame.MobileKeys
+        for _, name in ipairs(TILE_NAMES) do
+            local t = keys:FindFirstChild(name)
+            if t then pcall(function() t.Active = active end) end
+        end
+        -- also catches any invisible touch-zone nested under the tiles,
+        -- in case the tappable area isn't the visible image itself
+        for _, d in ipairs(keys:GetDescendants()) do
+            if d:IsA("GuiButton") then pcall(function() d.Active = active end) end
+        end
+    end)
+end
+
 -- ════════════════════════════════════════════════════════════
 -- vim helpers
 -- ════════════════════════════════════════════════════════════
@@ -295,9 +350,15 @@ local function vimUp(lane)
     end
 end
 
+-- a real tap isn't exactly 50ms every single time — small legitimacy touch
+local function tapDurSec()
+    if not humanize then return TAP_DUR end
+    return math.clamp(TAP_DUR + (math.random()-0.5)*0.03, 0.03, 0.09)
+end
+
 local function vimTap(lane)
     vimUp(lane); vimDown(lane)
-    task.delay(TAP_DUR, function() vimUp(lane) end)
+    task.delay(tapDurSec(), function() vimUp(lane) end)
 end
 
 -- ════════════════════════════════════════════════════════════
@@ -591,19 +652,100 @@ local function installChartScanHook()
             if type(sP[fnName]) == "function" then
                 local original = sP[fnName]
                 sP[fnName] = function(songModule, ...)
+                    local epoch = tick()
                     -- fresh "run" feel for every song, not just on enable — a
                     -- real player's warm-up and personal lean reset per attempt
-                    songStartTick  = tick()
+                    songStartTick  = epoch
                     personalBiasMs = hPersonalBias and (math.random()*8) or 0
                     streakState    = 0
                     table.clear(kpsLog)
                     task.spawn(function() pcall(analyzeChart, songModule) end)
+
+                    -- playback-rate divisor, if this call used one (practice/
+                    -- speed-adjusted modes) — defaults to 1 for normal play
+                    local extra = {...}
+                    local rate = tonumber(extra[6])
+                    if not rate or rate <= 0 then rate = 1 end
+                    pcall(buildChartSchedule, songModule, epoch, rate)
+
+                    if v8 and perfected then task.spawn(startLoop) end
+                    if blockManualTaps then
+                        task.spawn(function() task.wait(0.3); setTilesActive(false) end)
+                    end
                     return original(songModule, ...)
                 end
             end
         end
         scanHookInstalled = true
     end)
+end
+
+-- builds the per-lane, time-sorted note list perfect mode schedules
+-- against. same raw chart data as the difficulty scanner, kept as its
+-- own lightweight extraction so a bug in one never touches the other.
+buildChartSchedule = function(songModule, epoch, rate)
+    local mySide = 1
+    pcall(function()
+        local pv = v5:FindFirstChild("File") and v5.File:FindFirstChild("CurrentPlayer")
+        if pv and pv.Value and pv.Value.Name=="Player2" then mySide = 2 end
+    end)
+
+    local ok, rawNotes = pcall(function() return songModule["GetNotes"..mySide]() end)
+    local fresh = {{},{},{},{}}
+    if ok and type(rawNotes) == "table" then
+        rate = rate or 1
+        for _, n in pairs(rawNotes) do
+            if type(n)=="table" and type(n[2])=="number" and n[2]>=1 and n[2]<=4 then
+                local lane = n[2]
+                fresh[lane][#fresh[lane]+1] = {t=(n[1] or 0)/rate, hold=n[3] or 0}
+            end
+        end
+        for lane=1,4 do
+            table.sort(fresh[lane], function(a,b) return a.t < b.t end)
+        end
+    end
+    chartSchedule = fresh
+    chartEpoch    = epoch
+end
+
+-- fires one chart-scheduled press — perfect mode, so zero jitter, zero
+-- stagger, zero fatigue, on purpose: it's meant to represent the bot
+-- actually is, not a human
+local function fireChartNote(lane, note)
+    if not v8 or not perfected then return end
+    local KS = getMyKeySync()
+    if not (KS and KS.Visible) then return end
+    if laneHoldFrame[lane] then stopHold(lane,true) end
+    if note.hold and note.hold > 0.08 then
+        local marker = {}
+        laneHoldFrame[lane] = marker
+        vimUp(lane); vimDown(lane)
+        task.delay(note.hold, function()
+            if laneHoldFrame[lane] == marker then stopHold(lane,false) end
+        end)
+    else
+        vimTap(lane)
+    end
+end
+
+-- schedules every still-upcoming note in chartSchedule against real time,
+-- compensating for vim's injection latency — frame-rate independent, and
+-- immune to the calibration/scanning quirks the old on-screen detection had
+local function startChartScheduler()
+    local myRunId = {}
+    activeSchedulerToken = myRunId
+    local now = tick()
+    for lane=1,4 do
+        for _, note in ipairs(chartSchedule[lane]) do
+            local fireAt = chartEpoch + note.t - (vimLatencyMs/1000)
+            if fireAt > now then
+                task.delay(fireAt-now, function()
+                    if activeSchedulerToken ~= myRunId then return end
+                    fireChartNote(lane, note)
+                end)
+            end
+        end
+    end
 end
 
 -- ════════════════════════════════════════════════════════════
@@ -671,8 +813,9 @@ end
 -- that drifted past the normal trigger during a frame drop are
 -- still caught and fired rather than missed
 -- ════════════════════════════════════════════════════════════
-local function startLoop()
+startLoop = function()
     if mainLoop then mainLoop:Disconnect(); mainLoop=nil end
+    activeSchedulerToken = {}  -- invalidate any pending chart-scheduled presses from before
     seenNotes={}
     local cacheBuilt={}
 
@@ -741,7 +884,16 @@ local function startLoop()
         end
     end
 
-    if perfected then
+    local hasChart = chartEpoch ~= nil
+        and (#chartSchedule[1]+#chartSchedule[2]+#chartSchedule[3]+#chartSchedule[4] > 0)
+
+    if perfected and hasChart then
+        -- exact, chart-driven — genuinely 100%, no RunService connection needed,
+        -- the scheduled task.delay calls above do the actual firing
+        startChartScheduler()
+    elseif perfected then
+        -- no chart data for this song (hook unavailable, etc.) — fall back
+        -- to the old frame-reactive detection so perfect mode still works
         mainLoop = RunService.RenderStepped:Connect(function() tick_fn(true) end)
     else
         mainLoop = RunService.Heartbeat:Connect(function() tick_fn(false) end)
@@ -753,23 +905,23 @@ task.spawn(installChartScanHook)
 -- ════════════════════════════════════════════════════════════
 -- ui which looks amazing btw
 -- ════════════════════════════════════════════════════════════
-local infoTab  = window:AddTab("InfoTab",  {Text="ℹ info"       })
-local playTab  = window:AddTab("PlayTab",  {Text="▶ play"       })
-local advTab   = window:AddTab("AdvTab",   {Text="✦ advanced bp"})
-local tuneTab  = window:AddTab("TuneTab",  {Text="◈ tune"       })
+local infoTab  = window:AddTab("InfoTab",  {Text="info",        Icon="info"               })
+local playTab  = window:AddTab("PlayTab",  {Text="botplay",     Icon="play"                })
+local advTab   = window:AddTab("AdvTab",   {Text="advanced bp", Icon="sparkles"            })
+local tuneTab  = window:AddTab("TuneTab",  {Text="tune",        Icon="sliders-horizontal"  })
 
 -- ── info ─────────────────────────────────────────────────────
 local iL = infoTab:AddLeftGroupbox("IL",  {Text="about"       })
 local iR = infoTab:AddRightGroupbox("IR", {Text="feature list" })
 
-iL:AddLabel("IL1",{Text="<font color='#C41E3A'><b>fnf:r botplay</b></font> by woops &lt;3\n\nplays basically fnf: remix for you, automatically.\nhumanize makes it look genuinely played — perfect mode is there too if you just want raw precision instead.\nauto latency figures out the right timing on its own after a few seconds."})
+iL:AddLabel("IL1",{Text="<font color='#C41E3A'><b>bfnf:r botplay</b></font> by woops &lt;3\n\nplays basically fnf: remix for you, automatically.\nhumanize makes it look genuinely played — perfect mode is there too for genuine 100% accuracy instead.\nauto latency figures out the right timing on its own after a few seconds."})
 iL:AddSeparator("ILS1",{})
 iL:AddLabel("IL2",{Text="<font color='#D0D0D6'><b>recommended setup:</b></font>\n• humanize (advanced bp tab) → on, for a run that looks genuinely played\n• perfect mode → on instead, only if you want pure frame-perfect inputs\n• auto latency → on"})
 iL:AddSeparator("ILS2",{})
 iL:AddLabel("IL3",{Text="<b>right shift</b> = open / close the menu"})
 
 iR:AddLabel("IR1",{Text="<font color='#C41E3A'><b>play tab</b></font>"})
-iR:AddLabel("IR2",{Text="enable → turns botplay on or off\nperfect mode → the most accurate timing, lands right on the beat\ntile lights → lights up the on-screen keys for looks\nmiss jacks → skips super-fast repeat notes so it doesn't stumble"})
+iR:AddLabel("IR2",{Text="enable → turns botplay on or off\nperfect mode → genuinely 100% — reads the chart's exact timing instead of reacting to the screen\ntile lights → lights up the on-screen keys for looks\nmiss jacks → skips super-fast repeat notes so it doesn't stumble\ntiles are visual only → keys stay lit but stop registering real taps, so accidental presses can't interfere"})
 iR:AddSeparator("IRS1",{})
 iR:AddLabel("IR3",{Text="<font color='#D0D0D6'><b>advanced bp tab</b></font>"})
 iR:AddLabel("IR3B",{Text="humanize → plays with realistic, human-like timing instead of frame-perfect inputs\naccuracy & consistency → how good, and how steady, this 'player' is\ndifficulty scanner → points out a song's hardest sections the moment it loads"})
@@ -803,6 +955,7 @@ pL:AddToggle("Enable",{
                 vimUp(i)
             end
             if mainLoop then mainLoop:Disconnect(); mainLoop=nil end
+            activeSchedulerToken = {}
             stopAutoLatency()
             laneHoldFrame={nil,nil,nil,nil}; lanePressed={false,false,false,false}
             seenNotes={}
@@ -813,7 +966,7 @@ pL:AddToggle("Enable",{
 
 pL:AddToggle("Perfected",{
     Text="perfect mode", Value=false,
-    Tooltip="the most accurate timing mode — lands right on the beat, and overrides humanize while it's on",
+    Tooltip="genuinely 100% — reads the chart's exact note times instead of reacting to what's on screen, like an actual bot would",
     Callback=function(val)
         perfected=val
         if v8 then if mainLoop then mainLoop:Disconnect(); mainLoop=nil end; startLoop() end
@@ -837,6 +990,16 @@ pL:AddToggle("MissJacks",{
     Text="miss jack notes", Value=false,
     Tooltip="skips super-fast repeat notes on the same key so it doesn't stumble",
     Callback=function(val) missJacks=val end,
+})
+
+pL:AddToggle("BlockTaps",{
+    Text="tiles are visual only", Value=false,
+    Tooltip="the on-screen keys still light up, but stop registering real taps — no more accidental presses messing with a run",
+    Callback=function(val)
+        blockManualTaps = val
+        setTilesActive(not val)
+        window:Notification({Title="tiles are visual only",Text=val and "<font color='#C41E3A'>on</font>" or "off",Duration=2})
+    end,
 })
 
 -- ── advanced bp ──────────────────────────────────────────────
