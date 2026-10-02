@@ -1,6 +1,6 @@
 local lib = loadstring(game:HttpGet("https://raw.githubusercontent.com/Null-Cherry/Fire-Library/refs/heads/main/Loader.lua", true))()
 
-local VERSION = "v3.0-beta"  -- reminder to self to bump this each update, shows in the footer
+local VERSION = "v3.0-beta"  -- bump this each update — shows in the footer
 
 -- ── palette (galaxy collapse — crimson, ink black & white) ──
 local C_RED   = Color3.fromRGB(196, 30,  58)     -- crimson   #C41E3A
@@ -277,7 +277,6 @@ local chartIsInSpikeWindow -- forward declared; defined down in the scanner sect
 -- old on-screen detection automatically if chart data isn't available.
 local chartSchedule       = {{},{},{},{}}  -- per lane: sorted {t=, hold=} for the current song
 local chartEpoch          = nil            -- tick() matching chart-time 0; nil = no chart data yet
-local activeSchedulerToken = nil           -- invalidates stale/old scheduled presses
 local buildChartSchedule  -- forward declared; defined down in the scanner section
 local startLoop           -- forward declared; defined further down, the main run loop
 
@@ -666,9 +665,13 @@ local function installChartScanHook()
                     local extra = {...}
                     local rate = tonumber(extra[6])
                     if not rate or rate <= 0 then rate = 1 end
+                    -- this hook runs AS PART OF the game's own function call, so
+                    -- it only ever stashes data here — it never schedules or
+                    -- presses anything itself. perfect mode's own loop (started
+                    -- from the UI toggle, a safe call chain) notices the new
+                    -- chartEpoch on its own and rebuilds from it
                     pcall(buildChartSchedule, songModule, epoch, rate)
 
-                    if v8 and perfected then task.spawn(startLoop) end
                     if blockManualTaps then
                         task.spawn(function() task.wait(0.3); setTilesActive(false) end)
                     end
@@ -728,24 +731,23 @@ local function fireChartNote(lane, note)
     end
 end
 
--- schedules every still-upcoming note in chartSchedule against real time,
--- compensating for vim's injection latency — frame-rate independent, and
--- immune to the calibration/scanning quirks the old on-screen detection had
-local function startChartScheduler()
-    local myRunId = {}
-    activeSchedulerToken = myRunId
+-- flattens chartSchedule into one time-sorted list, each with its real
+-- fire time already worked out (compensating for vim's injection latency).
+-- only a LIST — nothing here touches input, so building/rebuilding this
+-- is always safe no matter what called it
+local function buildChartTimeline()
+    local list = {}
     local now = tick()
     for lane=1,4 do
         for _, note in ipairs(chartSchedule[lane]) do
             local fireAt = chartEpoch + note.t - (vimLatencyMs/1000)
             if fireAt > now then
-                task.delay(fireAt-now, function()
-                    if activeSchedulerToken ~= myRunId then return end
-                    fireChartNote(lane, note)
-                end)
+                list[#list+1] = {fireAt=fireAt, lane=lane, note=note}
             end
         end
     end
+    table.sort(list, function(a,b) return a.fireAt < b.fireAt end)
+    return list
 end
 
 -- ════════════════════════════════════════════════════════════
@@ -815,7 +817,6 @@ end
 -- ════════════════════════════════════════════════════════════
 startLoop = function()
     if mainLoop then mainLoop:Disconnect(); mainLoop=nil end
-    activeSchedulerToken = {}  -- invalidate any pending chart-scheduled presses from before
     seenNotes={}
     local cacheBuilt={}
 
@@ -888,9 +889,27 @@ startLoop = function()
         and (#chartSchedule[1]+#chartSchedule[2]+#chartSchedule[3]+#chartSchedule[4] > 0)
 
     if perfected and hasChart then
-        -- exact, chart-driven — genuinely 100%, no RunService connection needed,
-        -- the scheduled task.delay calls above do the actual firing
-        startChartScheduler()
+        -- exact, chart-driven — genuinely 100%. runs on our own Heartbeat
+        -- connection (started from this UI toggle, a safe call chain) rather
+        -- than task.delay calls hanging off the song-start hook, which is
+        -- what was causing SendKeyEvent to lose its permissions
+        local timeline  = buildChartTimeline()
+        local idx       = 1
+        local seenEpoch = chartEpoch
+        mainLoop = RunService.Heartbeat:Connect(function()
+            if not v8 or not perfected then return end
+            if chartEpoch ~= seenEpoch then
+                -- a new song started mid-run — rebuild from the fresh chart
+                seenEpoch = chartEpoch
+                timeline  = buildChartTimeline()
+                idx = 1
+            end
+            local t = tick()
+            while idx <= #timeline and timeline[idx].fireAt <= t do
+                fireChartNote(timeline[idx].lane, timeline[idx].note)
+                idx = idx + 1
+            end
+        end)
     elseif perfected then
         -- no chart data for this song (hook unavailable, etc.) — fall back
         -- to the old frame-reactive detection so perfect mode still works
@@ -921,7 +940,7 @@ iL:AddSeparator("ILS2",{})
 iL:AddLabel("IL3",{Text="<b>right shift</b> = open / close the menu"})
 
 iR:AddLabel("IR1",{Text="<font color='#C41E3A'><b>play tab</b></font>"})
-iR:AddLabel("IR2",{Text="enable → turns botplay on or off\nperfect mode → genuinely 100% — reads the chart's exact timing instead of reacting to the screen\ntile lights → lights up the on-screen keys for looks\nmiss jacks → skips super-fast repeat notes so it doesn't stumble\ntiles are visual only → keys stay lit but stop registering real taps, so accidental presses can't interfere"})
+iR:AddLabel("IR2",{Text="enable → turns botplay on or off\nperfect mode → genuinely 100% — reads the chart's exact timing instead of reacting to the screen\ntile lights → lights up the on-screen keys for looks\nmiss jacks → skips super-fast repeat notes so it doesn't stumble\ndisable tile functionality → keys stay lit but stop registering real taps, so accidental presses can't interfere"})
 iR:AddSeparator("IRS1",{})
 iR:AddLabel("IR3",{Text="<font color='#D0D0D6'><b>advanced bp tab</b></font>"})
 iR:AddLabel("IR3B",{Text="humanize → plays with realistic, human-like timing instead of frame-perfect inputs\naccuracy & consistency → how good, and how steady, this 'player' is\ndifficulty scanner → points out a song's hardest sections the moment it loads"})
@@ -955,7 +974,6 @@ pL:AddToggle("Enable",{
                 vimUp(i)
             end
             if mainLoop then mainLoop:Disconnect(); mainLoop=nil end
-            activeSchedulerToken = {}
             stopAutoLatency()
             laneHoldFrame={nil,nil,nil,nil}; lanePressed={false,false,false,false}
             seenNotes={}
@@ -993,12 +1011,12 @@ pL:AddToggle("MissJacks",{
 })
 
 pL:AddToggle("BlockTaps",{
-    Text="tiles are visual only", Value=false,
+    Text="disable tile functionality", Value=false,
     Tooltip="the on-screen keys still light up, but stop registering real taps — no more accidental presses messing with a run",
     Callback=function(val)
         blockManualTaps = val
         setTilesActive(not val)
-        window:Notification({Title="tiles are visual only",Text=val and "<font color='#C41E3A'>on</font>" or "off",Duration=2})
+        window:Notification({Title="disable tile functionality",Text=val and "<font color='#C41E3A'>on</font>" or "off",Duration=2})
     end,
 })
 
