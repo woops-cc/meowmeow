@@ -108,6 +108,52 @@ local function huntGain(med)
     return math.clamp(0.18 + math.abs(med)/120, 0.18, 0.45)
 end
 
+-- ════════ perfect mode's OWN latency calibration ════════
+-- vimLatencyMs is tuned for the old scale-based detection, where MORE
+-- latency means firing LATER (it shrinks the trigger window). perfect
+-- mode's chart-exact formula is a direct subtraction, where MORE latency
+-- means firing EARLIER — the opposite relationship. sharing one value
+-- between both meant auto-latency was correcting vimLatencyMs using the
+-- wrong-for-perfect-mode direction the entire time perfect mode ran,
+-- actively fighting its own accuracy. this is perfect mode's own,
+-- separate value, corrected with the sign flipped to match its formula.
+local chartLatencyMs  = 111
+local chartLatencyConn = nil
+
+local function chartModeActive()
+    return perfected and chartEpoch ~= nil
+        and (#chartSchedule[1]+#chartSchedule[2]+#chartSchedule[3]+#chartSchedule[4] > 0)
+end
+
+local function startChartLatencyCalibration()
+    if chartLatencyConn then chartLatencyConn:Disconnect() end
+    local lastSample, lastText, lastTextTime = 0, "", 0
+    chartLatencyConn = RunService.Heartbeat:Connect(function()
+        if not chartModeActive() then return end
+        local now = tick()
+        if now - lastSample < 0.15 then return end
+        local mf = v5.PlayerGui:FindFirstChild("Main") and v5.PlayerGui.Main:FindFirstChild("MatchFrame")
+        if not mf then return end
+        local ind = mf:FindFirstChild("msIndic")
+        if not (ind and ind.Visible) then return end
+        local txt = ind.Text or ""
+        if txt ~= lastText then
+            lastText = txt; lastTextTime = now
+        elseif now - lastTextTime > 0.35 then
+            return
+        end
+        lastSample = now
+        local val = tonumber(txt:match("(-?%d+%.?%d*)"))
+        if not val or math.abs(val) > 35 then return end
+        -- sign flipped from the old system on purpose — see note above
+        chartLatencyMs = math.clamp(chartLatencyMs - val*0.4, 0, 300)
+    end)
+end
+
+local function stopChartLatencyCalibration()
+    if chartLatencyConn then chartLatencyConn:Disconnect(); chartLatencyConn=nil end
+end
+
 local function alMedian()
     if #alBuf == 0 then return 0 end
     local s = {}
@@ -150,6 +196,7 @@ local function startAutoLatency()
 
     autoLatencyConn = RunService.Heartbeat:Connect(function()
         if not autoLatency then return end
+        if chartModeActive() then return end  -- chart mode has its own calibration now
         local now = tick()
         local interval = (alPhase=="hunt") and HUNT_INTERVAL or LOCK_INTERVAL
         if now - lastSample < interval then return end
@@ -312,20 +359,60 @@ local function lightTile(lane, lit)
     end
 end
 
+-- .Active alone only blocks Roblox's built-in GuiButton input system — if
+-- the game reads raw touch/input events itself (common for precise,
+-- multi-touch rhythm controls), that wouldn't be stopped by .Active at
+-- all. a real, front-most invisible button physically sitting on top of
+-- each tile blocks the touch at the engine level regardless of how the
+-- game underneath is listening for it.
+local tapBlockOverlays = {}
+
+local function ensureTapBlockOverlays()
+    pcall(function()
+        local keys = v5.PlayerGui.Main.MatchFrame.MobileKeys
+        for _, name in ipairs(TILE_NAMES) do
+            local tile = keys:FindFirstChild(name)
+            if tile then
+                local existing = tapBlockOverlays[name]
+                if not existing or existing.Parent ~= tile then
+                    if existing then existing:Destroy() end
+                    local overlay = Instance.new("TextButton")
+                    overlay.Name = "BPTapBlock_"..name
+                    overlay.BackgroundTransparency = 1
+                    overlay.Text = ""
+                    overlay.AutoButtonColor = false
+                    overlay.ZIndex = (tile.ZIndex or 1) + 50
+                    overlay.Size = UDim2.new(1,0,1,0)
+                    overlay.Position = UDim2.new(0,0,0,0)
+                    overlay.Visible = false
+                    overlay.Active = true
+                    overlay.Parent = tile
+                    tapBlockOverlays[name] = overlay
+                end
+            end
+        end
+    end)
+end
+
 -- turns real touch input on/off for the on-screen tiles without touching
 -- how they look — so tile lights still work, but an accidental tap can't
 -- register as a press, miss, or bad rating anymore
 local function setTilesActive(active)
+    ensureTapBlockOverlays()
     pcall(function()
         local keys = v5.PlayerGui.Main.MatchFrame.MobileKeys
         for _, name in ipairs(TILE_NAMES) do
             local t = keys:FindFirstChild(name)
             if t then pcall(function() t.Active = active end) end
+            local ov = tapBlockOverlays[name]
+            if ov then ov.Visible = not active end
         end
         -- also catches any invisible touch-zone nested under the tiles,
         -- in case the tappable area isn't the visible image itself
         for _, d in ipairs(keys:GetDescendants()) do
-            if d:IsA("GuiButton") then pcall(function() d.Active = active end) end
+            if d:IsA("GuiButton") and not d.Name:match("^BPTapBlock_") then
+                pcall(function() d.Active = active end)
+            end
         end
     end)
 end
@@ -647,7 +734,7 @@ local function installChartScanHook()
         end
         if not hostScript then return end
         local sP = require(hostScript.songPlay)
-        for _, fnName in ipairs({"PlaySong","AutoSong","BotPlaySong"}) do
+        for _, fnName in ipairs({"PlaySong"}) do
             if type(sP[fnName]) == "function" then
                 local original = sP[fnName]
                 sP[fnName] = function(songModule, ...)
@@ -711,13 +798,42 @@ buildChartSchedule = function(songModule, epoch, rate)
     chartEpoch    = epoch
 end
 
+-- is there an actual, currently-visible note waiting in this lane right
+-- now? the chart tells fireChartNote roughly WHEN to press, but this is
+-- the ground truth check before it actually does
+local function liveNoteInLane(lane)
+    local KS = getMyKeySync()
+    if not (KS and KS.Visible) then return false end
+    local af = KS:FindFirstChild("Arrow"..lane)
+    local nf = af and af:FindFirstChild("Notes")
+    if not nf then return false end
+    for _, c in ipairs(nf:GetChildren()) do
+        if c:IsA("GuiObject") and c.Visible and c.Name:sub(1,5) ~= "Hold_" then
+            return true
+        end
+    end
+    return false
+end
+
 -- fires one chart-scheduled press — perfect mode, so zero jitter, zero
 -- stagger, zero fatigue, on purpose: it's meant to represent the bot
 -- actually is, not a human
 local function fireChartNote(lane, note)
     if not v8 or not perfected then return end
-    local KS = getMyKeySync()
-    if not (KS and KS.Visible) then return end
+
+    -- confirm a real note is actually here before pressing — covers any
+    -- start-of-song delay we couldn't see from outside (the chart's clock
+    -- starts counting before the match visually begins), and skips chart
+    -- entries that aren't actually ours to hit right now. costs nothing
+    -- when timing is already correct, since the note is already waiting
+    local tries = 0
+    while not liveNoteInLane(lane) do
+        tries = tries + 1
+        if tries > 130 then return end  -- ~2s of retrying — genuinely not ours, skip cleanly
+        if not v8 or not perfected then return end
+        task.wait(0.015)
+    end
+
     if laneHoldFrame[lane] then stopHold(lane,true) end
     if note.hold and note.hold > 0.08 then
         local marker = {}
@@ -740,7 +856,7 @@ local function buildChartTimeline()
     local now = tick()
     for lane=1,4 do
         for _, note in ipairs(chartSchedule[lane]) do
-            local fireAt = chartEpoch + note.t - (vimLatencyMs/1000)
+            local fireAt = chartEpoch + note.t - (chartLatencyMs/1000)
             if fireAt > now then
                 list[#list+1] = {fireAt=fireAt, lane=lane, note=note}
             end
@@ -885,17 +1001,19 @@ startLoop = function()
         end
     end
 
-    local hasChart = chartEpoch ~= nil
-        and (#chartSchedule[1]+#chartSchedule[2]+#chartSchedule[3]+#chartSchedule[4] > 0)
-
-    if perfected and hasChart then
-        -- exact, chart-driven — genuinely 100%. runs on our own Heartbeat
-        -- connection (started from this UI toggle, a safe call chain) rather
-        -- than task.delay calls hanging off the song-start hook, which is
-        -- what was causing SendKeyEvent to lose its permissions
+    if perfected and chartModeActive() then
+        -- exact, chart-driven — genuinely 100%. the Heartbeat connection
+        -- (started from this UI toggle, a safe call chain) only looks ahead
+        -- and hands each note to task.delay for the actual precise press —
+        -- firing straight off Heartbeat meant landing anywhere up to a
+        -- whole frame late, which was enough to turn some Perfects into
+        -- Sicks. task.delay scheduled from here, not from the song-start
+        -- hook, keeps the capability fix from before intact
+        startChartLatencyCalibration()
         local timeline  = buildChartTimeline()
         local idx       = 1
         local seenEpoch = chartEpoch
+        local LOOKAHEAD = 0.75
         mainLoop = RunService.Heartbeat:Connect(function()
             if not v8 or not perfected then return end
             if chartEpoch ~= seenEpoch then
@@ -905,16 +1023,23 @@ startLoop = function()
                 idx = 1
             end
             local t = tick()
-            while idx <= #timeline and timeline[idx].fireAt <= t do
-                fireChartNote(timeline[idx].lane, timeline[idx].note)
+            while idx <= #timeline and timeline[idx].fireAt <= t + LOOKAHEAD do
+                local item     = timeline[idx]
+                local atEpoch  = seenEpoch
+                task.delay(math.max(0, item.fireAt - t), function()
+                    if seenEpoch ~= atEpoch then return end  -- song changed since this was scheduled
+                    fireChartNote(item.lane, item.note)
+                end)
                 idx = idx + 1
             end
         end)
     elseif perfected then
         -- no chart data for this song (hook unavailable, etc.) — fall back
         -- to the old frame-reactive detection so perfect mode still works
+        stopChartLatencyCalibration()
         mainLoop = RunService.RenderStepped:Connect(function() tick_fn(true) end)
     else
+        stopChartLatencyCalibration()
         mainLoop = RunService.Heartbeat:Connect(function() tick_fn(false) end)
     end
 end
@@ -975,6 +1100,7 @@ pL:AddToggle("Enable",{
             end
             if mainLoop then mainLoop:Disconnect(); mainLoop=nil end
             stopAutoLatency()
+            stopChartLatencyCalibration()
             laneHoldFrame={nil,nil,nil,nil}; lanePressed={false,false,false,false}
             seenNotes={}
             window:Notification({Title="botplay",Text="off",Duration=2})
