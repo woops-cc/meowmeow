@@ -108,16 +108,18 @@ local function huntGain(med)
     return math.clamp(0.18 + math.abs(med)/120, 0.18, 0.45)
 end
 
--- ════════ perfect mode's OWN latency calibration ════════
--- vimLatencyMs is tuned for the old scale-based detection, where MORE
--- latency means firing LATER (it shrinks the trigger window). perfect
--- mode's chart-exact formula is a direct subtraction, where MORE latency
--- means firing EARLIER — the opposite relationship. sharing one value
--- between both meant auto-latency was correcting vimLatencyMs using the
--- wrong-for-perfect-mode direction the entire time perfect mode ran,
--- actively fighting its own accuracy. this is perfect mode's own,
--- separate value, corrected with the sign flipped to match its formula.
-local chartLatencyMs  = 111
+-- ════════ perfect mode's own latency value ════════
+-- vimLatencyMs belongs to the old scale based detection, where raising it
+-- shrinks the trigger window and makes the press land later. perfect
+-- mode's formula does the opposite, raising it makes the press land
+-- earlier. sharing one number between the two meant auto latency was
+-- nudging vimLatencyMs in the wrong direction for perfect mode the whole
+-- time it was running. now that the final press timing comes straight off
+-- the note's own position instead of a predicted moment, all this number
+-- has to account for is the small gap between calling SendKeyEvent and
+-- the game actually registering it, which is a much smaller and steadier
+-- thing to tune than before.
+local chartLatencyMs   = 20
 local chartLatencyConn = nil
 
 local function chartModeActive()
@@ -127,26 +129,25 @@ end
 
 local function startChartLatencyCalibration()
     if chartLatencyConn then chartLatencyConn:Disconnect() end
-    local lastSample, lastText, lastTextTime = 0, "", 0
+    -- each distinct reading gets used exactly once, the moment it first
+    -- shows up. the old version re-applied the same reading two or three
+    -- times before it finally aged out, so every hit got counted more
+    -- than once and the value slowly walked toward one of its limits over
+    -- a long song instead of settling down
+    local lastSeenText = nil
     chartLatencyConn = RunService.Heartbeat:Connect(function()
         if not chartModeActive() then return end
-        local now = tick()
-        if now - lastSample < 0.15 then return end
         local mf = v5.PlayerGui:FindFirstChild("Main") and v5.PlayerGui.Main:FindFirstChild("MatchFrame")
         if not mf then return end
         local ind = mf:FindFirstChild("msIndic")
         if not (ind and ind.Visible) then return end
         local txt = ind.Text or ""
-        if txt ~= lastText then
-            lastText = txt; lastTextTime = now
-        elseif now - lastTextTime > 0.35 then
-            return
-        end
-        lastSample = now
+        if txt == lastSeenText then return end
+        lastSeenText = txt
         local val = tonumber(txt:match("(-?%d+%.?%d*)"))
         if not val or math.abs(val) > 35 then return end
-        -- sign flipped from the old system on purpose — see note above
-        chartLatencyMs = math.clamp(chartLatencyMs - val*0.4, 0, 300)
+        -- the sign here is flipped on purpose, see the note up top
+        chartLatencyMs = math.clamp(chartLatencyMs - val*0.25, 0, 120)
     end)
 end
 
@@ -327,9 +328,6 @@ local chartEpoch          = nil            -- tick() matching chart-time 0; nil 
 local buildChartSchedule  -- forward declared; defined down in the scanner section
 local startLoop           -- forward declared; defined further down, the main run loop
 
--- ════════ mobile tiles: visual-only option ════════
-local blockManualTaps = false  -- tiles stay visible/lit but stop registering real taps
-
 -- ════════════════════════════════════════════════════════════
 -- tile lighting thingy for legitimacy and stuffs 😇😇
 -- path: MatchFrame.MobileKeys.Left/Down/Up/Right
@@ -357,64 +355,6 @@ local function lightTile(lane, lit)
         local tw = TweenService:Create(t, TILE_TW, {ImageTransparency=0.8})
         tileTweens[lane]=tw; tw:Play()
     end
-end
-
--- .Active alone only blocks Roblox's built-in GuiButton input system — if
--- the game reads raw touch/input events itself (common for precise,
--- multi-touch rhythm controls), that wouldn't be stopped by .Active at
--- all. a real, front-most invisible button physically sitting on top of
--- each tile blocks the touch at the engine level regardless of how the
--- game underneath is listening for it.
-local tapBlockOverlays = {}
-
-local function ensureTapBlockOverlays()
-    pcall(function()
-        local keys = v5.PlayerGui.Main.MatchFrame.MobileKeys
-        for _, name in ipairs(TILE_NAMES) do
-            local tile = keys:FindFirstChild(name)
-            if tile then
-                local existing = tapBlockOverlays[name]
-                if not existing or existing.Parent ~= tile then
-                    if existing then existing:Destroy() end
-                    local overlay = Instance.new("TextButton")
-                    overlay.Name = "BPTapBlock_"..name
-                    overlay.BackgroundTransparency = 1
-                    overlay.Text = ""
-                    overlay.AutoButtonColor = false
-                    overlay.ZIndex = (tile.ZIndex or 1) + 50
-                    overlay.Size = UDim2.new(1,0,1,0)
-                    overlay.Position = UDim2.new(0,0,0,0)
-                    overlay.Visible = false
-                    overlay.Active = true
-                    overlay.Parent = tile
-                    tapBlockOverlays[name] = overlay
-                end
-            end
-        end
-    end)
-end
-
--- turns real touch input on/off for the on-screen tiles without touching
--- how they look — so tile lights still work, but an accidental tap can't
--- register as a press, miss, or bad rating anymore
-local function setTilesActive(active)
-    ensureTapBlockOverlays()
-    pcall(function()
-        local keys = v5.PlayerGui.Main.MatchFrame.MobileKeys
-        for _, name in ipairs(TILE_NAMES) do
-            local t = keys:FindFirstChild(name)
-            if t then pcall(function() t.Active = active end) end
-            local ov = tapBlockOverlays[name]
-            if ov then ov.Visible = not active end
-        end
-        -- also catches any invisible touch-zone nested under the tiles,
-        -- in case the tappable area isn't the visible image itself
-        for _, d in ipairs(keys:GetDescendants()) do
-            if d:IsA("GuiButton") and not d.Name:match("^BPTapBlock_") then
-                pcall(function() d.Active = active end)
-            end
-        end
-    end)
 end
 
 -- ════════════════════════════════════════════════════════════
@@ -758,10 +698,6 @@ local function installChartScanHook()
                     -- from the UI toggle, a safe call chain) notices the new
                     -- chartEpoch on its own and rebuilds from it
                     pcall(buildChartSchedule, songModule, epoch, rate)
-
-                    if blockManualTaps then
-                        task.spawn(function() task.wait(0.3); setTilesActive(false) end)
-                    end
                     return original(songModule, ...)
                 end
             end
@@ -798,41 +734,55 @@ buildChartSchedule = function(songModule, epoch, rate)
     chartEpoch    = epoch
 end
 
--- is there an actual, currently-visible note waiting in this lane right
--- now? the chart tells fireChartNote roughly WHEN to press, but this is
--- the ground truth check before it actually does
-local function liveNoteInLane(lane)
+-- finds the actual note waiting in this lane right now, if there is one
+local function findLiveNote(lane)
     local KS = getMyKeySync()
-    if not (KS and KS.Visible) then return false end
+    if not (KS and KS.Visible) then return nil end
     local af = KS:FindFirstChild("Arrow"..lane)
     local nf = af and af:FindFirstChild("Notes")
-    if not nf then return false end
+    if not nf then return nil end
     for _, c in ipairs(nf:GetChildren()) do
         if c:IsA("GuiObject") and c.Visible and c.Name:sub(1,5) ~= "Hold_" then
-            return true
+            return c
         end
     end
-    return false
+    return nil
 end
 
--- fires one chart-scheduled press — perfect mode, so zero jitter, zero
--- stagger, zero fatigue, on purpose: it's meant to represent the bot
--- actually is, not a human
+-- fires one chart scheduled press. perfect mode is meant to be the bot
+-- itself, so there's no jitter, no stagger and no fatigue added here,
+-- that stuff belongs to humanize instead
 local function fireChartNote(lane, note)
     if not v8 or not perfected then return end
 
-    -- confirm a real note is actually here before pressing — covers any
-    -- start-of-song delay we couldn't see from outside (the chart's clock
-    -- starts counting before the match visually begins), and skips chart
-    -- entries that aren't actually ours to hit right now. costs nothing
-    -- when timing is already correct, since the note is already waiting
-    local tries = 0
-    while not liveNoteInLane(lane) do
+    -- wait until a real note is actually sitting here before doing
+    -- anything. this covers a pre song delay we have no way to see from
+    -- outside, and it quietly skips chart entries that turn out not to be
+    -- ours to hit right now. costs nothing when timing is already right,
+    -- since the note is already there the first time we check
+    local target, tries = nil, 0
+    while true do
+        target = findLiveNote(lane)
+        if target then break end
         tries = tries + 1
-        if tries > 130 then return end  -- ~2s of retrying — genuinely not ours, skip cleanly
+        if tries > 130 then return end
         if not v8 or not perfected then return end
         task.wait(0.015)
     end
+
+    -- the game works out your timing by reading this exact note's own
+    -- screen position the moment your key press lands, that is the whole
+    -- judgment formula. so rather than trust the chart's predicted moment
+    -- on its own, grab the note's real position right now and work out
+    -- exactly how much time is left before it crosses the hit line, using
+    -- the same math the game itself scores you with. this stays accurate
+    -- at any scroll speed with no warm up needed, since speed is read
+    -- fresh every single time instead of assumed ahead of time
+    local spd = math.clamp(tonumber((_G and _G.Settings and _G.Settings.NoteSpeed) or 2) or 2, 0.5, 10)
+    local remaining = math.clamp(math.abs(target.Position.Y.Scale) / (5.5*spd), 0, 1.5)
+    local lead = chartLatencyMs / 1000
+    local waitSec = remaining - lead
+    if waitSec > 0 then task.wait(waitSec) end
 
     if laneHoldFrame[lane] then stopHold(lane,true) end
     if note.hold and note.hold > 0.08 then
@@ -1065,7 +1015,7 @@ iL:AddSeparator("ILS2",{})
 iL:AddLabel("IL3",{Text="<b>right shift</b> = open / close the menu"})
 
 iR:AddLabel("IR1",{Text="<font color='#C41E3A'><b>play tab</b></font>"})
-iR:AddLabel("IR2",{Text="enable → turns botplay on or off\nperfect mode → genuinely 100% — reads the chart's exact timing instead of reacting to the screen\ntile lights → lights up the on-screen keys for looks\nmiss jacks → skips super-fast repeat notes so it doesn't stumble\ndisable tile functionality → keys stay lit but stop registering real taps, so accidental presses can't interfere"})
+iR:AddLabel("IR2",{Text="enable → turns botplay on or off\nperfect mode → genuinely 100% — reads the chart's exact timing instead of reacting to the screen\ntile lights → lights up the on-screen keys for looks\nmiss jacks → skips super-fast repeat notes so it doesn't stumble"})
 iR:AddSeparator("IRS1",{})
 iR:AddLabel("IR3",{Text="<font color='#D0D0D6'><b>advanced bp tab</b></font>"})
 iR:AddLabel("IR3B",{Text="humanize → plays with realistic, human-like timing instead of frame-perfect inputs\naccuracy & consistency → how good, and how steady, this 'player' is\ndifficulty scanner → points out a song's hardest sections the moment it loads"})
@@ -1134,16 +1084,6 @@ pL:AddToggle("MissJacks",{
     Text="miss jack notes", Value=false,
     Tooltip="skips super-fast repeat notes on the same key so it doesn't stumble",
     Callback=function(val) missJacks=val end,
-})
-
-pL:AddToggle("BlockTaps",{
-    Text="disable tile functionality", Value=false,
-    Tooltip="the on-screen keys still light up, but stop registering real taps — no more accidental presses messing with a run",
-    Callback=function(val)
-        blockManualTaps = val
-        setTilesActive(not val)
-        window:Notification({Title="disable tile functionality",Text=val and "<font color='#C41E3A'>on</font>" or "off",Duration=2})
-    end,
 })
 
 -- ── advanced bp ──────────────────────────────────────────────
