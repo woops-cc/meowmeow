@@ -119,8 +119,9 @@ end
 -- has to account for is the small gap between calling SendKeyEvent and
 -- the game actually registering it, which is a much smaller and steadier
 -- thing to tune than before.
-local chartLatencyMs   = 20
-local chartLatencyConn = nil
+local chartLatencyMs    = 20
+local chartLatencyConn  = nil
+local chartSavedHitLate = false
 
 local function chartModeActive()
     return perfected and chartEpoch ~= nil
@@ -129,6 +130,11 @@ end
 
 local function startChartLatencyCalibration()
     if chartLatencyConn then chartLatencyConn:Disconnect() end
+    -- this needs HitLate on to read the indicator at all, same as the old
+    -- system did, but it sets and restores it itself now instead of
+    -- relying on the old system to have done it
+    chartSavedHitLate = _G.Settings and _G.Settings.HitLate or false
+    if _G.Settings then _G.Settings.HitLate = true end
     -- each distinct reading gets used exactly once, the moment it first
     -- shows up. the old version re-applied the same reading two or three
     -- times before it finally aged out, so every hit got counted more
@@ -153,6 +159,7 @@ end
 
 local function stopChartLatencyCalibration()
     if chartLatencyConn then chartLatencyConn:Disconnect(); chartLatencyConn=nil end
+    if _G.Settings then _G.Settings.HitLate = chartSavedHitLate end
 end
 
 local function alMedian()
@@ -778,7 +785,11 @@ local function fireChartNote(lane, note)
     -- the same math the game itself scores you with. this stays accurate
     -- at any scroll speed with no warm up needed, since speed is read
     -- fresh every single time instead of assumed ahead of time
-    local spd = math.clamp(tonumber((_G and _G.Settings and _G.Settings.NoteSpeed) or 2) or 2, 0.5, 10)
+    -- 0.8 to 5 here on purpose, that is the exact range the game itself
+    -- clamps speed to inside its own judgment formula. using a different
+    -- range here would throw the whole calculation off at any speed
+    -- outside it
+    local spd = math.clamp(tonumber((_G and _G.Settings and _G.Settings.NoteSpeed) or 2) or 2, 0.8, 5)
     local remaining = math.clamp(math.abs(target.Position.Y.Scale) / (5.5*spd), 0, 1.5)
     local lead = chartLatencyMs / 1000
     local waitSec = remaining - lead
@@ -888,6 +899,16 @@ startLoop = function()
 
     local function tick_fn(sync)
         if not v8 then return end
+        if sync and chartModeActive() then
+            -- this is the perfect mode fallback, and chart data has now
+            -- shown up since it started (a song began after we had to
+            -- fall back). hand off to the real chart scheduler now that
+            -- it is actually available. this call is safe here because
+            -- it is running from a connection that was started by the UI
+            -- toggle, not from inside the song-start hook
+            task.spawn(startLoop)
+            return
+        end
         local KS = getMyKeySync()
         if not (KS and KS.Visible) then return end
 
@@ -959,6 +980,7 @@ startLoop = function()
         -- whole frame late, which was enough to turn some Perfects into
         -- Sicks. task.delay scheduled from here, not from the song-start
         -- hook, keeps the capability fix from before intact
+        stopAutoLatency()
         startChartLatencyCalibration()
         local timeline  = buildChartTimeline()
         local idx       = 1
@@ -987,9 +1009,11 @@ startLoop = function()
         -- no chart data for this song (hook unavailable, etc.) — fall back
         -- to the old frame-reactive detection so perfect mode still works
         stopChartLatencyCalibration()
+        if autoLatency then startAutoLatency() end
         mainLoop = RunService.RenderStepped:Connect(function() tick_fn(true) end)
     else
         stopChartLatencyCalibration()
+        if autoLatency then startAutoLatency() end
         mainLoop = RunService.Heartbeat:Connect(function() tick_fn(false) end)
     end
 end
@@ -1037,7 +1061,6 @@ pL:AddToggle("Enable",{
             laneHoldFrame={nil,nil,nil,nil}; lanePressed={false,false,false,false}
             for i=1,4 do vimUp(i) end
             seenNotes={}; startLoop()
-            if autoLatency then startAutoLatency() end
             songStartTick  = tick()
             personalBiasMs = hPersonalBias and (math.random()*8) or 0
             streakState    = 0
@@ -1187,7 +1210,15 @@ tL:AddToggle("AutoLatency",{
     Tooltip="watches your timing and adjusts itself automatically — just leave it on",
     Callback=function(val)
         autoLatency=val
-        if val and v8 then startAutoLatency() elseif not val then stopAutoLatency() end
+        if chartModeActive() then
+            -- chart mode has its own calibration and this switch does not
+            -- touch it either way, it only matters for humanize and
+            -- perfect mode's fallback
+        elseif val and v8 then
+            startAutoLatency()
+        elseif not val then
+            stopAutoLatency()
+        end
         window:Notification({
             Title="auto latency",
             Text=val and "<font color='#C41E3A'>on</font> — adjusting itself" or "off — using manual slider",
