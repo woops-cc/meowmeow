@@ -1983,17 +1983,25 @@ local HBCon = RunService.Heartbeat:Connect(function(dt)
         LastHeartbeat = tick() 
     end
     
-    local RootPart = LocalPlayer.Character.HumanoidRootPart
-    local InWater = false
-    local IsSliding = (CurrentAnim and CurrentAnim[1] == "slide")
-    
-    -- Updated: Active water check will now skip scanning if EnableAutoSwim is false
-    if getgenv().EnableAutoSwim and not IsSliding and RootPart then
-        for _, waterPart in ipairs(WaterParts) do
-            if IsPartEntirelyInPart(waterPart, RootPart) then InWater = true; break end
+    local Character = LocalPlayer.Character
+local RootPart = Character and Character:FindFirstChild("HumanoidRootPart")
+local Head = Character and Character:FindFirstChild("Head")
+
+local InWater = false
+local IsSliding = (CurrentAnim and CurrentAnim[1] == "slide")
+
+if getgenv().EnableAutoSwim and not IsSliding and RootPart and Head then
+    local headPosition = Head.Position
+
+    for _, waterPart in ipairs(WaterParts) do
+        if IsPointInPart(waterPart, headPosition) then
+            InWater = true
+            break
         end
     end
-    getgenv().IsSwimming = InWater
+end
+
+getgenv().IsSwimming = InWater
 end)
 AddConnection(HBCon)
 
