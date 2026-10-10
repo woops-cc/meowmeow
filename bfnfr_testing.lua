@@ -1,6 +1,6 @@
 local lib = loadstring(game:HttpGet("https://raw.githubusercontent.com/Null-Cherry/Fire-Library/refs/heads/main/Loader.lua", true))()
 
-local VERSION = "v3.1-beta"  -- bump this each update, it shows in the footer
+local VERSION = "v3.2-beta"  -- bump this each update, it shows in the footer
 
 -- ── palette (galaxy collapse: crimson, ink black & white) ──
 local C_RED   = Color3.fromRGB(196, 30,  58)     -- crimson   #C41E3A
@@ -57,17 +57,6 @@ local Players      = game:GetService("Players")
 local v5           = Players.LocalPlayer
 
 -- ════════════════════════════════════════════════════════════
--- shared state
--- these have to stay above chartModeActive(). a local only exists below the
--- line it's declared on, so when they lived further down that function read
--- them as globals (always nil) and chart mode never turned on
--- ════════════════════════════════════════════════════════════
-local perfected     = false
-local chartSchedule = {{},{},{},{}}  -- per lane, sorted {t=, hold=} for the current song
-local chartEpoch    = nil            -- tick() at chart time 0, nil = no chart data yet
-local chartSide     = nil            -- side (1 or 2) the game is playing, set by the song hook
-
--- ════════════════════════════════════════════════════════════
 -- timing & auto latency notes
 -- ────────────────────────────────────────────────────────────
 -- perfect window:  |scale| <= 0.71775 * spd
@@ -119,56 +108,6 @@ local function huntGain(med)
     return math.clamp(0.18 + math.abs(med)/120, 0.18, 0.45)
 end
 
--- ════════ chart mode's own latency ════════
--- vimLatencyMs is for the old screen-based detection, where a bigger value
--- makes the press land later. chart mode works the other way around, a bigger
--- value here makes the press land earlier. sharing one number meant auto
--- latency was pushing it the wrong direction for chart mode, so chart mode
--- gets its own. the press time now comes off the note's live position, so this
--- only has to cover the small gap between SendKeyEvent and the game actually
--- registering the key, which is small and steady.
-local chartLatencyMs    = 20
-local chartLatencyConn  = nil
-local chartSavedHitLate = false
-
-local function chartModeActive()
-    return perfected and chartEpoch ~= nil
-        and (#chartSchedule[1]+#chartSchedule[2]+#chartSchedule[3]+#chartSchedule[4] > 0)
-end
-
-local function startChartLatencyCalibration()
-    if chartLatencyConn then return end  -- already running
-    -- msIndic only shows up with HitLate on. remember the real value so
-    -- stop can put it back (the old auto latency does the same on its own)
-    chartSavedHitLate = _G.Settings and _G.Settings.HitLate or false
-    if _G.Settings then _G.Settings.HitLate = true end
-    -- every distinct reading gets used exactly once, the moment it first shows
-    -- up. the old version applied the same reading 2-3 times before it aged
-    -- out, so hits got counted more than once and the value slowly walked
-    -- toward a limit over a long song instead of settling
-    local lastSeenText = nil
-    chartLatencyConn = RunService.Heartbeat:Connect(function()
-        if not chartModeActive() then return end
-        local mf = v5.PlayerGui:FindFirstChild("Main") and v5.PlayerGui.Main:FindFirstChild("MatchFrame")
-        if not mf then return end
-        local ind = mf:FindFirstChild("msIndic")
-        if not (ind and ind.Visible) then return end
-        local txt = ind.Text or ""
-        if txt == lastSeenText then return end
-        lastSeenText = txt
-        local val = tonumber(txt:match("(-?%d+%.?%d*)"))
-        if not val or math.abs(val) > 35 then return end
-        -- sign is flipped on purpose (a + reading means early, so lead less)
-        chartLatencyMs = math.clamp(chartLatencyMs - val*0.25, 0, 120)
-    end)
-end
-
-local function stopChartLatencyCalibration()
-    if not chartLatencyConn then return end  -- never started, so nothing to restore
-    chartLatencyConn:Disconnect(); chartLatencyConn = nil
-    if _G.Settings then _G.Settings.HitLate = chartSavedHitLate end
-end
-
 local function alMedian()
     if #alBuf == 0 then return 0 end
     local s = {}
@@ -215,7 +154,6 @@ local function startAutoLatency()
 
     autoLatencyConn = RunService.Heartbeat:Connect(function()
         if not autoLatency then return end
-        if chartModeActive() then return end  -- chart mode has its own calibration
         local now = tick()
         local interval = (alPhase=="hunt") and HUNT_INTERVAL or LOCK_INTERVAL
         if now - lastSample < interval then return end
@@ -297,6 +235,7 @@ local TAP_DUR     = 0.05
 
 local v8            = false
 local missJacks     = false
+local perfected     = false
 local tileLights    = false
 local mainLoop      = nil
 
@@ -304,6 +243,7 @@ local laneHoldFrame = {nil,nil,nil,nil}
 local lanePressed   = {false,false,false,false}
 local seenNotes     = {}
 local lastLaneTime  = {0,0,0,0}   -- last press time per lane (jack detection)
+local pressSeq      = {0,0,0,0}   -- bumps on every press, so an old tap timer can't release a newer press
 
 -- simple-mode hit chance weights, only used while humanize (below) is off
 local perfectChance = 100
@@ -336,15 +276,7 @@ local lastScanResult       = nil     -- {totalSeconds=, noteCount=, spikes={ {t=
 local scanHookInstalled    = false
 local chartIsInSpikeWindow -- forward declared, defined down in the scanner section
 
--- ════════ perfect mode: chart scheduling ════════
--- perfect mode is the "actual bot" mode. instead of reacting to where notes are
--- on screen it reads the same GetNotes1()/GetNotes2() chart the scanner grabs
--- and presses each note at its real time. if there's no chart data it falls
--- back to the old on-screen detection by itself.
--- (perfected / chartSchedule / chartEpoch / chartSide are declared at the top)
-local claimedNotes        = setmetatable({}, {__mode="k"})  -- notes a press thread already picked
-local buildChartSchedule  -- forward declared, defined in the scanner section
-local startLoop           -- forward declared, defined further down (main run loop)
+local startLoop  -- forward declared, defined further down (main run loop)
 
 -- ════════════════════════════════════════════════════════════
 -- tile lighting thingy for legitimacy and stuffs 😇😇
@@ -364,6 +296,7 @@ end
 
 local function lightTile(lane, lit)
     if not tileLights then return end
+    if lit and perfected then return end  -- perfect mode skips the tile lights
     local t = getMobileTile(lane)
     if not t then return end
     if tileTweens[lane] then tileTweens[lane]:Cancel(); tileTweens[lane]=nil end
@@ -403,7 +336,13 @@ end
 
 local function vimTap(lane)
     vimUp(lane); vimDown(lane)
-    task.delay(tapDurSec(), function() vimUp(lane) end)
+    pressSeq[lane] = pressSeq[lane] + 1
+    local mine = pressSeq[lane]
+    task.delay(tapDurSec(), function()
+        -- only the newest press on a lane gets to let go, so an old tap can't
+        -- cut a hold or a newer tap short
+        if pressSeq[lane] == mine then vimUp(lane) end
+    end)
 end
 
 -- ════════════════════════════════════════════════════════════
@@ -436,12 +375,13 @@ end
 
 local function holdForDuration(lane, holdFrame, spd, pressedAt)
     laneHoldFrame[lane] = holdFrame
+    pressSeq[lane] = pressSeq[lane] + 1  -- this press owns the key now
     local scale   = math.abs(holdFrame.Size.Y.Scale)
     local p88     = scale / (5.5*spd) + 0.07
     local leadSec = vimLatencyMs / 1000
     local elapsed = tick() - pressedAt
     local rem     = math.max(0, p88 - leadSec - elapsed)
-    if humanize and not perfected then
+    if humanize then
         -- real fingers let go a hair late, never early. letting go early is
         -- what breaks the combo on a hold, so this only ever adds time
         rem = rem + (0.005 + math.random()*0.025)
@@ -577,13 +517,10 @@ local function computeHumanizeOffsetMs(jackGap)
     return math.clamp(raw, 0, 165), realMiss
 end
 
--- side = optional, the side the game passed to PlaySong. without it this
--- guesses from CurrentPlayer like before
-local function getMyKeySync(side)
+local function getMyKeySync()
     local M = v5.PlayerGui:FindFirstChild("Main")
         and v5.PlayerGui.Main:FindFirstChild("MatchFrame")
     if not (M and M.Visible) then return nil end
-    if side then return M:FindFirstChild("KeySync"..side) end
     local pv = v5:FindFirstChild("File") and v5.File:FindFirstChild("CurrentPlayer")
     if pv and pv.Value then
         return M:FindFirstChild("KeySync"..(pv.Value.Name=="Player2" and 2 or 1))
@@ -675,7 +612,7 @@ local function analyzeChart(songModule, hookSide)
     end
 
     lastScanResult = {totalSeconds=notes[#notes].t, noteCount=#notes, spikes=spikes}
-    if hAutoScan then
+    if hAutoScan and not perfected then  -- perfect mode keeps the screen clean
         window:Notification({Title="song scanned", Text=buildScanMessage(lastScanResult), Duration=5})
     end
 end
@@ -714,22 +651,15 @@ local function installChartScanHook()
                     streakState    = 0
                     table.clear(kpsLog)
 
-                    -- args after songModule: [2] = side the game plays (1 or 2),
-                    -- [6] = playback rate divisor (practice / speed modes), 1 in
-                    -- normal play
+                    -- the 2nd arg after songModule is the side the game plays (1 or 2)
                     local extra = {...}
                     local side = tonumber(extra[2])
                     if side ~= 1 and side ~= 2 then side = nil end
-                    local rate = tonumber(extra[6])
-                    if not rate or rate <= 0 then rate = 1 end
 
-                    task.spawn(function() pcall(analyzeChart, songModule, side) end)
                     -- this hook runs AS PART OF the game's own function call, so
-                    -- it only ever stashes data. it never schedules or presses
-                    -- anything. perfect mode's own loop (started from the ui
-                    -- toggle, a safe call chain) notices the new chartEpoch by
-                    -- itself and rebuilds from it
-                    pcall(buildChartSchedule, songModule, epoch, rate, side)
+                    -- it only reads the chart for the scanner. it never presses
+                    -- or schedules anything
+                    task.spawn(function() pcall(analyzeChart, songModule, side) end)
                     return original(songModule, ...)
                 end
             end
@@ -738,137 +668,193 @@ local function installChartScanHook()
     end)
 end
 
--- builds the per-lane, time-sorted note list perfect mode presses from. same
--- raw chart as the scanner but its own small extraction, so a bug in one
--- can't touch the other
-buildChartSchedule = function(songModule, epoch, rate, hookSide)
-    local mySide = resolveSide(hookSide)
+-- ════════════════════════════════════════════════════════════
+-- perfect mode
+-- ────────────────────────────────────────────────────────────
+-- the "actual bot" mode, and it overrides everything else. humanize, hit
+-- chances, miss jacks, tile lights, the scanner popup and auto latency are
+-- all ignored while it's on, and they work like normal again the moment
+-- it's off.
+-- every frame it checks the notes in each lane, works out how long until each
+-- one crosses the line from the note's own movement (no speed formulas, so
+-- scroll speed and sv don't matter), and presses on the frame that lands
+-- closest to the hit. holds are let go using the game's own finish rule.
+-- it calibrates its press lead over the first few notes, then locks it and
+-- stops touching it. only a long, clear drift unlocks it again.
+-- ════════════════════════════════════════════════════════════
+local pfLead         = 0.017   -- sec between our press and the frame the game reads the note on
+local pfLocked       = false
+local pfBuf          = {}
+local pfGoodN        = 0
+local pfBadN         = 0
+local pfDt           = 1/60    -- smoothed frame time
+local pfLastText     = nil
+local pfActive       = false
+local pfSavedHitLate = false
+local pfHeldAt       = {0,0,0,0}
+local pfTrack        = setmetatable({}, {__mode="k"})  -- per note movement samples
+local pfDone         = setmetatable({}, {__mode="k"})  -- notes already pressed or passed
 
-    local ok, rawNotes = pcall(function() return songModule["GetNotes"..mySide]() end)
-    local fresh = {{},{},{},{}}
-    if ok and type(rawNotes) == "table" then
-        rate = rate or 1
-        for _, n in pairs(rawNotes) do
-            if type(n)=="table" and type(n[2])=="number" and n[2]>=1 and n[2]<=4 then
-                local lane = n[2]
-                -- the game divides both the note time and the hold length by
-                -- the rate, so do the same
-                fresh[lane][#fresh[lane]+1] = {t=(n[1] or 0)/rate, hold=(tonumber(n[3]) or 0)/rate}
-            end
-        end
-        for lane=1,4 do
-            table.sort(fresh[lane], function(a,b) return a.t < b.t end)
-        end
+local function startPerfectMode()
+    if not pfActive then
+        pfActive = true
+        -- msIndic only shows with HitLate on. remember the real value so it
+        -- can be put back when perfect mode stops
+        pfSavedHitLate = _G.Settings and _G.Settings.HitLate or false
+        if _G.Settings then _G.Settings.HitLate = true end
     end
-    chartSchedule = fresh
-    chartSide     = mySide
-    chartEpoch    = epoch   -- last on purpose, the loop watches this to know a new song started
+    pfBuf = {}; pfLastText = nil
 end
 
--- picks the note a press for this lane should aim at: visible, not a hold
--- body, not already picked by another press thread, and closest to the hit
--- line. the game scores a press against the nearest un-hit notes in the lane
--- and destroys a note the moment it's hit, so this lines up with what it
--- will actually judge. skipping picked notes matters when a few notes in one
--- lane are alive at once (jacks), or a hit note hasn't been cleaned up yet
-local function findLiveNote(lane)
-    local KS = getMyKeySync(chartSide)
-    if not (KS and KS.Visible) then return nil end
-    local af = KS:FindFirstChild("Arrow"..lane)
-    local nf = af and af:FindFirstChild("Notes")
-    if not nf then return nil end
-    local best, bestDist = nil, math.huge
-    for _, c in ipairs(nf:GetChildren()) do
-        if c:IsA("GuiObject") and c.Visible and c.Name:sub(1,5) ~= "Hold_" and not claimedNotes[c] then
-            local d = math.abs(c.Position.Y.Scale)
-            if d < bestDist then bestDist = d; best = c end
-        end
-    end
-    return best
+local function stopPerfectMode()
+    if not pfActive then return end  -- never started, nothing to put back
+    pfActive = false
+    if _G.Settings then _G.Settings.HitLate = pfSavedHitLate end
 end
 
--- fires one chart press. perfect mode is the bot itself, so there's no
--- jitter, stagger or fatigue in here, that all belongs to humanize
-local function fireChartNote(lane, note, atEpoch)
-    if not v8 or not perfected then return end
+local function pfMedian(list)
+    local s = {}
+    for _, v in ipairs(list) do s[#s+1] = v end
+    table.sort(s)
+    local n = #s
+    if n == 0 then return 0 end
+    if n % 2 == 1 then return s[(n+1)/2] end
+    return (s[n/2] + s[n/2+1]) / 2
+end
 
-    -- wait for a real note to be sitting in this lane before doing anything.
-    -- covers any pre-song delay we can't see from outside, and skips chart
-    -- entries that turn out not to be ours to hit. costs nothing when timing
-    -- is already right, the note is there on the first check
-    local target, tries = nil, 0
-    while true do
-        target = findLiveNote(lane)
-        if target then break end
-        tries = tries + 1
-        if tries > 130 then return end
-        if not v8 or not perfected or chartEpoch ~= atEpoch then return end
-        task.wait(0.015)
-    end
-    claimedNotes[target] = true
-
-    -- the game works out your timing from this exact note's screen position
-    -- when your key lands, that's its whole judgment formula. so instead of
-    -- trusting the chart's predicted moment, read the note's real position now
-    -- and work out how long until it crosses the line, same math the game
-    -- scores you with. stays accurate at any scroll speed with no warm-up,
-    -- since speed is read fresh every time
-    -- 0.8 to 5 on purpose, that's the exact range the game clamps speed to in
-    -- its own formula. a different range here throws the math off outside it
-    -- notes spawn about 2s out, so anything past 2.5s can't be real
-    local spd = math.clamp(tonumber((_G and _G.Settings and _G.Settings.NoteSpeed) or 2) or 2, 0.8, 5)
-    local remaining = math.clamp(math.abs(target.Position.Y.Scale) / (5.5*spd), 0, 2.5)
-    local lead = chartLatencyMs / 1000
-    local waitSec = remaining - lead
-    if waitSec > 0 then
-        task.wait(waitSec)
-        if not v8 or not perfected or chartEpoch ~= atEpoch then return end
-    end
-    -- the note was hit or cleaned up while we waited, don't throw a stray tap
-    if not target.Parent then return end
-
-    if laneHoldFrame[lane] then stopHold(lane,true) end
-    if note.hold and note.hold > 0.08 then
-        local marker = {}
-        laneHoldFrame[lane] = marker
-        vimUp(lane); vimDown(lane)
-        task.delay(note.hold, function()
-            if laneHoldFrame[lane] == marker then stopHold(lane,false) end
-        end)
+-- one fresh ms reading = one sample. it calibrates until the readings settle,
+-- then locks and stops adjusting. locked means hands off, it only lets go if
+-- the readings are clearly off for a while (like after an fps change)
+local function pfCalibrate(mf)
+    local ind = mf and mf:FindFirstChild("msIndic")
+    if not (ind and ind.Visible) then return end
+    local txt = ind.Text or ""
+    if txt == pfLastText then return end
+    pfLastText = txt
+    local val = tonumber(txt:match("(-?%d+%.?%d*)"))
+    if not val or math.abs(val) > (pfLocked and 20 or 60) then return end
+    pfBuf[#pfBuf+1] = val
+    if #pfBuf < (pfLocked and 8 or 5) then return end
+    local med = pfMedian(pfBuf)
+    pfBuf = {}
+    if pfLocked then
+        pfBadN = (math.abs(med) > 6) and (pfBadN + 1) or 0
+        if pfBadN >= 3 then pfLocked = false; pfBadN = 0; pfGoodN = 0 end
     else
-        vimTap(lane)
+        -- a + reading means the press was early, so lead less
+        pfLead = math.clamp(pfLead - med/1000 * 0.6, 0, 0.25)
+        pfGoodN = (math.abs(med) <= 3) and (pfGoodN + 1) or 0
+        if pfGoodN >= 2 then pfLocked = true; pfGoodN = 0; pfBadN = 0 end
     end
 end
 
--- flattens chartSchedule into one time-sorted list. every press thread starts
--- CHART_START_LEAD early on purpose. the real press moment is worked out live
--- from the note's position inside fireChartNote, so the start only has to be
--- comfortably earlier than any lead the calibration can reach (it caps at
--- 120ms). if the start was tied to chartLatencyMs, a lead that grew mid-song
--- couldn't take effect until the next song. only builds a list, nothing here
--- touches input, so it's always safe to call
-local CHART_START_LEAD = 0.2
+local PF_LATE = 0.12  -- a note further past the line than this is too late to hit
 
-local function buildChartTimeline()
-    local list = {}
-    local now = tick()
-    local lead = chartLatencyMs/1000
-    for lane=1,4 do
-        for _, note in ipairs(chartSchedule[lane]) do
-            local hitAt = chartEpoch + note.t
-            if hitAt - lead > now then   -- still reachable
-                list[#list+1] = {fireAt=hitAt - CHART_START_LEAD, lane=lane, note=note}
+-- how long until this note crosses the line (negative = already past it),
+-- from the note's own movement over the last 0.1 to 0.3s. it works with the
+-- signed distance, so the maths stays straight even when a note crosses the
+-- line between two frames
+local function pfRemaining(c, scale, now, fallbackV)
+    local s = pfTrack[c]
+    if not s then
+        -- a note comes in from one side and that side counts as "before the
+        -- line". one that first shows up right at the line is assumed to be
+        -- on the usual (positive) side
+        local side = (scale < -0.5) and -1 or 1
+        local d0 = scale * side
+        pfTrack[c] = {side=side, pT=now, pD=d0, cT=now, cD=d0}
+        return d0 / fallbackV  -- first look, nothing to measure yet
+    end
+    local d = scale * s.side
+    if now - s.cT >= 0.15 then
+        s.pT, s.pD, s.cT, s.cD = s.cT, s.cD, now, d
+    end
+    local span = now - s.pT
+    if span < 0.08 then return d / fallbackV end
+    local v = (s.pD - d) / span  -- scale units per second, + = getting closer
+    if v < 0.02 then return d / fallbackV end
+    return d / v
+end
+
+-- the note in this lane that is due first (skips hold bodies and notes
+-- already pressed)
+local function pfNearest(nf, now, fallbackV)
+    local best, bestRem = nil, math.huge
+    for _, c in ipairs(nf:GetChildren()) do
+        if c:IsA("GuiObject") and c.Visible and c.Name:sub(1,5) ~= "Hold_" and not pfDone[c] then
+            local rem = pfRemaining(c, c.Position.Y.Scale, now, fallbackV)
+            if rem < -PF_LATE then
+                pfDone[c] = true   -- too late to hit, leave it
+            elseif rem < bestRem then
+                best, bestRem = c, rem
             end
         end
     end
-    table.sort(list, function(a,b) return a.fireAt < b.fireAt end)
-    return list
+    return best, bestRem
+end
+
+local function perfectStep(dt)
+    if not v8 or not perfected then return end
+    pfDt = math.clamp(pfDt*0.9 + math.min(dt or pfDt, 0.05)*0.1, 0.004, 0.05)
+    local KS = getMyKeySync()
+    if not (KS and KS.Visible) then return end
+    local now = tick()
+    local S = _G.Settings or {}
+    local dir = tonumber(S.Direction) or 1
+    local fallbackV = math.max(1, 5.5 * (tonumber(S.NoteSpeed) or 2))
+
+    pfCalibrate(KS.Parent)
+
+    -- press on the frame that lands closest to the hit: the first frame where
+    -- the note is within our lead plus half a frame of the line
+    local threshold = pfLead + pfDt/2
+
+    for lane=1,4 do
+        local af = KS:FindFirstChild("Arrow"..lane)
+        local nf = af and af:FindFirstChild("Notes")
+        if nf then
+            -- let go of a hold the moment the game counts it as finished.
+            -- same check the game runs when the key comes up: the hold's
+            -- size plus its position has to be 1.5 or less. 1.3 leaves room
+            local hf = laneHoldFrame[lane]
+            if hf then
+                local held = now - pfHeldAt[lane]
+                local done = held > 15 or not hf.Parent
+                if not done then
+                    done = math.abs(hf.Size.Y.Scale) + hf.Position.Y.Scale * dir <= 1.3
+                end
+                if done and held > 0.03 then stopHold(lane, false) end
+            end
+
+            -- press everything that's due this frame (fast jacks can have
+            -- more than one note due at once)
+            for _=1,4 do
+                local note, rem = pfNearest(nf, now, fallbackV)
+                if not (note and rem <= threshold) then break end
+                pfDone[note] = true
+                if laneHoldFrame[lane] then stopHold(lane, true) end
+                local holdFrame = nil
+                if note:GetAttribute("HoldHead") == true then
+                    holdFrame = nf:FindFirstChild("Hold_"..note.Name)
+                    if holdFrame and math.abs(holdFrame.Size.Y.Scale) < 0.01 then holdFrame = nil end
+                end
+                if holdFrame then
+                    vimUp(lane); vimDown(lane)
+                    pressSeq[lane] = pressSeq[lane] + 1
+                    laneHoldFrame[lane] = holdFrame
+                    pfHeldAt[lane] = now
+                else
+                    vimTap(lane)
+                end
+            end
+        end
+    end
 end
 
 -- ════════════════════════════════════════════════════════════
 -- note handler !!!
 -- ════════════════════════════════════════════════════════════
-local function handleNote(lane, isHold, holdFrame, arrowFrame, sync, spd, chordDelayMs)
+local function handleNote(lane, isHold, holdFrame, arrowFrame, spd, chordDelayMs)
     chordDelayMs = chordDelayMs or 0
     local now = tick()
     local jackGap = now - (lastLaneTime[lane] or 0)
@@ -893,14 +879,6 @@ local function handleNote(lane, isHold, holdFrame, arrowFrame, sync, spd, chordD
         else
             vimTap(lane)
         end
-    end
-
-    if sync then
-        -- perfect mode always fires immediately, on purpose. perfect mode and
-        -- humanize are opposite philosophies, and the RenderStepped loop that
-        -- calls this with sync=true is exactly what perfect mode turns on
-        fire()
-        return
     end
 
     if humanize then
@@ -932,20 +910,16 @@ end
 -- ════════════════════════════════════════════════════════════
 startLoop = function()
     if mainLoop then mainLoop:Disconnect(); mainLoop=nil end
+    -- never leave a key stuck down when the mode changes
+    for i=1,4 do
+        if laneHoldFrame[i] then stopHold(i,false) end
+        vimUp(i)
+    end
     seenNotes={}
     local cacheBuilt={}
 
-    local function tick_fn(sync)
+    local function tick_fn()
         if not v8 then return end
-        if sync and chartModeActive() then
-            -- this is the perfect mode fallback, and chart data has shown up
-            -- since it started (a song began after we had to fall back). hand
-            -- off to the real chart scheduler. safe to do from here because
-            -- this connection was started by the ui toggle, not by the
-            -- song-start hook
-            task.spawn(startLoop)
-            return
-        end
         local KS = getMyKeySync()
         if not (KS and KS.Visible) then return end
 
@@ -1002,56 +976,23 @@ startLoop = function()
         local isChord = #toPress > 1
         for i, p in ipairs(toPress) do
             local chordDelayMs = 0
-            if isChord and not sync and humanize and hChordStagger and i > 1 then
+            if isChord and humanize and hChordStagger and i > 1 then
                 chordDelayMs = math.abs(p.lane - toPress[1].lane) * (3 + math.random()*6)
             end
-            handleNote(p.lane, p.isHold, p.holdFrame, p.af, sync, spd, chordDelayMs)
+            handleNote(p.lane, p.isHold, p.holdFrame, p.af, spd, chordDelayMs)
         end
     end
 
-    if perfected and chartModeActive() then
-        -- exact and chart driven. the Heartbeat connection (started from the
-        -- ui toggle, a safe call chain) only looks ahead and hands each note
-        -- to task.delay for the real press. pressing straight off Heartbeat
-        -- landed up to a whole frame late, enough to turn some Perfects into
-        -- Sicks. scheduling task.delay from here and not from the song-start
-        -- hook keeps the capability fix intact
+    if perfected then
+        -- perfect mode takes over completely. the old auto latency is shut
+        -- off and none of the humanize stuff is touched
         stopAutoLatency()
-        startChartLatencyCalibration()
-        window:Notification({Title="perfect mode", Text="chart timing <font color='#C41E3A'>locked in</font>", Duration=2})
-        local timeline  = buildChartTimeline()
-        local idx       = 1
-        local seenEpoch = chartEpoch
-        local LOOKAHEAD = 0.75
-        mainLoop = RunService.Heartbeat:Connect(function()
-            if not v8 or not perfected then return end
-            if chartEpoch ~= seenEpoch then
-                -- a new song started mid-run, rebuild from the fresh chart
-                seenEpoch = chartEpoch
-                timeline  = buildChartTimeline()
-                idx = 1
-            end
-            local t = tick()
-            while idx <= #timeline and timeline[idx].fireAt <= t + LOOKAHEAD do
-                local item     = timeline[idx]
-                local atEpoch  = seenEpoch
-                task.delay(math.max(0, item.fireAt - t), function()
-                    if seenEpoch ~= atEpoch then return end  -- song changed since this was scheduled
-                    fireChartNote(item.lane, item.note, atEpoch)
-                end)
-                idx = idx + 1
-            end
-        end)
-    elseif perfected then
-        -- no chart data for this song (hook unavailable, etc), fall back to
-        -- the old frame-reactive detection so perfect mode still works
-        stopChartLatencyCalibration()
-        if autoLatency then startAutoLatency() end
-        mainLoop = RunService.RenderStepped:Connect(function() tick_fn(true) end)
+        startPerfectMode()
+        mainLoop = RunService.RenderStepped:Connect(perfectStep)
     else
-        stopChartLatencyCalibration()
+        stopPerfectMode()
         if autoLatency then startAutoLatency() end
-        mainLoop = RunService.Heartbeat:Connect(function() tick_fn(false) end)
+        mainLoop = RunService.Heartbeat:Connect(function() tick_fn() end)
     end
 end
 
@@ -1070,19 +1011,19 @@ local iR = infoTab:AddRightGroupbox("IR", {Text="feature list" })
 
 iL:AddLabel("IL1",{Text="<font color='#C41E3A'><b>bfnf:r botplay</b></font> by woops &lt;3\n\nplays basically fnf: remix for you, automatically.\nhumanize makes it look genuinely played. perfect mode is there too for a true 100% instead.\nauto latency figures out the right timing on its own after a few seconds."})
 iL:AddSeparator("ILS1",{})
-iL:AddLabel("IL2",{Text="<font color='#D0D0D6'><b>recommended setup:</b></font>\n• humanize (advanced bp tab) → on, for a run that looks genuinely played\n• perfect mode → on instead, only if you want pure frame-perfect inputs\n• auto latency → on"})
+iL:AddLabel("IL2",{Text="<font color='#D0D0D6'><b>recommended setup:</b></font>\n• humanize (advanced bp tab) → on, for a run that looks genuinely played\n• perfect mode → on instead for a true 100%. it overrides everything else while it's on\n• auto latency → on"})
 iL:AddSeparator("ILS2",{})
 iL:AddLabel("IL3",{Text="<b>right shift</b> = open / close the menu"})
 
 iR:AddLabel("IR1",{Text="<font color='#C41E3A'><b>botplay tab</b></font>"})
-iR:AddLabel("IR2",{Text="enable → turns botplay on or off\nperfect mode → a true 100%, reads the chart's exact timing instead of reacting to the screen\ntile lights → lights up the on-screen keys for looks\nmiss jacks → skips super-fast repeat notes so it doesn't stumble\nauto latency → watches your timing and adjusts itself, no setup needed\nvim latency → a manual timing offset, only used when auto latency is off\nhit chances → weights, not percentages, only used while humanize is off"})
+iR:AddLabel("IR2",{Text="enable → turns botplay on or off\nperfect mode → a true 100%, presses every note on the exact frame it lands. overrides everything else while it's on\ntile lights → lights up the on-screen keys for looks\nmiss jacks → skips super-fast repeat notes so it doesn't stumble\nauto latency → watches your timing and adjusts itself, no setup needed\nvim latency → a manual timing offset, only used when auto latency is off\nhit chances → weights, not percentages, only used while humanize is off"})
 iR:AddSeparator("IRS1",{})
 iR:AddLabel("IR3",{Text="<font color='#D0D0D6'><b>advanced bp tab</b></font>"})
 iR:AddLabel("IR3B",{Text="humanize → plays with realistic, human-like timing instead of frame-perfect inputs\naccuracy & consistency → how good, and how steady, this 'player' is\ndifficulty scanner → points out a song's hardest sections the moment it loads"})
 iR:AddSeparator("IRS2",{})
 iR:AddLabel("IR5",{Text="<font color='#C41E3A'><b>works with</b></font>\n✓ mid-song speed changes\n✓ up & down scroll charts\n✓ modded charts\n✓ smooth at high fps, and still keeps up if your fps drops\n✓ hold notes and short (blue) notes"})
 
--- ── botplay (the old tune tab lives here now) ────────────────
+-- ── botplay ──────────────────────────────────────────────────
 local pL = playTab:AddLeftGroupbox( "PL", {Text="botplay"     })
 local pR = playTab:AddRightGroupbox("PR", {Text="hit chances" })
 
@@ -1107,7 +1048,7 @@ pL:AddToggle("Enable",{
             end
             if mainLoop then mainLoop:Disconnect(); mainLoop=nil end
             stopAutoLatency()
-            stopChartLatencyCalibration()
+            stopPerfectMode()
             laneHoldFrame={nil,nil,nil,nil}; lanePressed={false,false,false,false}
             seenNotes={}
             window:Notification({Title="botplay",Text="off",Duration=2})
@@ -1117,11 +1058,11 @@ pL:AddToggle("Enable",{
 
 pL:AddToggle("Perfected",{
     Text="perfect mode", Value=false,
-    Tooltip="a true 100%. reads the chart's exact note times instead of reacting to what's on screen, like an actual bot would",
+    Tooltip="a true 100%. presses every note on the exact frame it lands and overrides everything else (humanize, auto latency, hit chances, miss jacks, tile lights) until you turn it off",
     Callback=function(val)
         perfected=val
         if v8 then if mainLoop then mainLoop:Disconnect(); mainLoop=nil end; startLoop() end
-        window:Notification({Title="perfect mode",Text=val and "<font color='#C41E3A'>on</font>" or "off",Duration=2})
+        window:Notification({Title="perfect mode",Text=val and "<font color='#C41E3A'>on</font>, overriding everything else" or "off, everything else is back",Duration=3})
     end,
 })
 
@@ -1150,10 +1091,9 @@ pL:AddToggle("AutoLatency",{
     Tooltip="watches your timing and adjusts itself automatically, just leave it on",
     Callback=function(val)
         autoLatency=val
-        if chartModeActive() then
-            -- chart mode has its own calibration and this switch doesn't touch
-            -- it either way, it only matters for humanize and perfect mode's
-            -- fallback
+        if perfected then
+            -- perfect mode ignores this and calibrates on its own, the switch
+            -- is just remembered for when perfect mode goes off
         elseif val and v8 then
             startAutoLatency()
         elseif not val then
@@ -1161,7 +1101,7 @@ pL:AddToggle("AutoLatency",{
         end
         window:Notification({
             Title="auto latency",
-            Text=val and "<font color='#C41E3A'>on</font>, adjusting itself" or "off, using manual slider",
+            Text=(val and "<font color='#C41E3A'>on</font>, adjusting itself" or "off, using manual slider")..(perfected and " (ignored while perfect mode is on)" or ""),
             Duration=3
         })
     end,
