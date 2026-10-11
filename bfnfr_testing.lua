@@ -1,6 +1,39 @@
-local lib = loadstring(game:HttpGet("https://raw.githubusercontent.com/Null-Cherry/Fire-Library/refs/heads/main/Loader.lua", true))()
+-- ── loading the ui library ──
+local function loadLibrary()
+    local ok, res = pcall(function()
+        return loadstring(game:HttpGet("https://raw.githubusercontent.com/Null-Cherry/Fire-Library/refs/heads/main/Loader.lua", true))()
+    end)
+    if ok and res then return res end
+    warn("[bfnf:r] couldn't load the ui library: " .. tostring(res))
+    return nil
+end
 
-local VERSION = "v3.2-beta"  -- bump this each update, it shows in the footer
+local lib = loadLibrary()
+if not lib then return end
+
+-- every ui call goes through guard(), so one element failing (a library
+-- change, a bad option) only costs that element instead of the whole ui, and
+-- the error gets printed so it can be fixed
+local nothing = setmetatable({}, {__index = function() return function() return nil end end})
+local containers = {AddTab=true, AddLeftGroupbox=true, AddRightGroupbox=true, AddGroupbox=true}
+local function guard(obj, label)
+    if obj == nil or obj == nothing then return nothing end
+    return setmetatable({}, {__index = function(_, key)
+        local v = obj[key]
+        if type(v) ~= "function" then return v end
+        return function(_, ...)
+            local ok, res = pcall(v, obj, ...)
+            if not ok then
+                warn(("[bfnf:r] ui: %s:%s failed: %s"):format(label, tostring(key), tostring(res)))
+                res = nil
+            end
+            if containers[key] then return guard(res, label.."/"..tostring(key)) end
+            return res
+        end
+    end})
+end
+
+local VERSION = "v3.3-beta"  -- bump this each update, it shows in the footer
 
 -- ── palette (galaxy collapse: crimson, ink black & white) ──
 local C_RED   = Color3.fromRGB(196, 30,  58)     -- crimson   #C41E3A
@@ -8,7 +41,7 @@ local C_STEEL = Color3.fromRGB(208, 208, 214)    -- pale grey #D0D0D6
 local C_BG    = Color3.fromRGB(10,  10,  12)     -- near-black bg
 local C_WHITE = Color3.fromRGB(232, 232, 236)    -- soft white text
 
-local window = lib:Window("bfnfr_ap", {
+local WINDOW_OPTIONS = {
     Title    = "<font color='#E8E8EC'><b>bfnf:r</b></font><font color='#C41E3A'> botplay</font>",
     Icon     = "125411711221424",
     Footer   = "<font color='#C41E3A'>woops &lt;3</font>  ·  basically fnf: remix  ·  "..VERSION,
@@ -23,7 +56,26 @@ local window = lib:Window("bfnfr_ap", {
     ImageTransparency = 0.55,
     ImageColor        = Color3.new(1, 1, 1),
     Theme = { Back=C_BG, Main=C_RED, Stroke=C_STEEL, Text=C_WHITE },
-})
+}
+
+-- try the full window first. if the library chokes on something, retry
+-- without the image and blur extras, then with the bare minimum
+local window
+for attempt = 1, 3 do
+    local opts = WINDOW_OPTIONS
+    if attempt == 2 then
+        opts = {}
+        for k, v in pairs(WINDOW_OPTIONS) do opts[k] = v end
+        opts.Image, opts.ImageEnabled, opts.Icon, opts.EnableUIBlur = nil, false, nil, false
+    elseif attempt == 3 then
+        opts = {Title = "bfnf:r botplay", Keybind = Enum.KeyCode.RightShift}
+    end
+    local ok, res = pcall(function() return lib:Window("bfnfr_ap", opts) end)
+    if ok and res then window = res; break end
+    warn(("[bfnf:r] window attempt %d failed: %s"):format(attempt, tostring(res)))
+end
+if not window then return end
+window = guard(window, "window")
 
 -- image fix: mirror Image into ImageContent once the window has built
 task.defer(function()
@@ -96,6 +148,7 @@ local alBuf          = {}
 local alGoodN        = 0
 local alBadN         = 0
 local alSavedHitLate = false
+local pressLog       = {}   -- recent presses and the error meant for each (the calibration needs it)
 
 local function alReset(phase)
     alBuf={}; alGoodN=0; alBadN=0
@@ -116,11 +169,6 @@ local function alMedian()
     local n = #s
     if n%2==1 then return s[math.ceil(n/2)]
     else return (s[n/2] + s[n/2+1]) / 2 end
-end
-
-local function calcTriggerScale(spd)
-    local c = math.clamp(0.71775 - (vimLatencyMs/1000)*5.5, 0.05, 0.71775)
-    return c * spd
 end
 
 local function startAutoLatency()
@@ -178,11 +226,20 @@ local function startAutoLatency()
         lastSample = now
 
         local val = tonumber(txt:match("(-?%d+%.?%d*)"))
+        if not val then return end
+        -- the reading includes the error the player meant to make, so take
+        -- that back out and only look at what's left, which is the real
+        -- latency. one clear press has to line up with it, otherwise skip it
+        local nLog = #pressLog
+        local lastPress = pressLog[nLog]
+        if not lastPress or now - lastPress.t > 0.14 then return end
+        if nLog > 1 and lastPress.t - pressLog[nLog-1].t < 0.045 then return end
+        val = val + lastPress.e
         -- outlier window: holds/misses give big values we ignore. tighter once
         -- locked, since anything wildly off by then is almost certainly a
         -- hold/miss artifact and not a real correction
         local outlierMax = (alPhase=="locked") and 18 or 35
-        if not val or math.abs(val) > outlierMax then return end
+        if math.abs(val) > outlierMax then return end
 
         table.insert(alBuf, val)
         if #alBuf > BUF_SIZE then table.remove(alBuf, 1) end
@@ -241,8 +298,6 @@ local mainLoop      = nil
 
 local laneHoldFrame = {nil,nil,nil,nil}
 local lanePressed   = {false,false,false,false}
-local seenNotes     = {}
-local lastLaneTime  = {0,0,0,0}   -- last press time per lane (jack detection)
 local pressSeq      = {0,0,0,0}   -- bumps on every press, so an old tap timer can't release a newer press
 
 -- simple-mode hit chance weights, only used while humanize (below) is off
@@ -261,7 +316,21 @@ local hJackFatigue     = true   -- fast same-key repeats get sloppier
 local hChordStagger    = true   -- same-beat notes across lanes get a tiny stagger
 local hWarmupFatigue   = true   -- shakier at the very start, can drift late-song
 local hPersonalBias    = true   -- a small consistent lean, re-rolled each run
-local hAllowRealMiss   = true   -- lets brutal speed cause a genuine miss sometimes
+local hAllowRealMiss   = true   -- lets it genuinely miss a note or drop a hold now and then
+local hMistakes        = 35     -- 0-100, how often it slips
+local hLeanMs          = 0      -- manual early/late lean in ms (+ = late)
+local hEarlyHits       = true   -- hits can land early as well as late
+local hDriftOn         = true   -- the timing average wanders slowly
+local hFocusOn         = true   -- attention comes and goes
+local hFingerBias      = true   -- each lane has its own small habit
+local hSelfCorrect     = true   -- eases the next press after an early or late one
+local hStreaks         = true   -- hot and cold streaks
+local hRush            = true   -- presses a touch early when the notes get dense
+local hColdStart       = true   -- sloppier on the first notes after a break
+local hSlips           = true   -- the odd bigger error
+local hTiltOn          = true   -- a slip makes the next few worse
+local hHumanHolds      = true   -- holds are let go like a person would
+local hHumanTaps       = true   -- tap lengths vary and shrink on fast patterns
 local fingerSpeedLimit = 100    -- kps, replaces the old hard "legit" cap
 
 local kpsLog          = {}      -- rolling press timestamps, for finger-speed overflow
@@ -330,15 +399,15 @@ end
 -- a real tap isn't exactly 50ms every time, small legitimacy touch.
 -- perfect mode skips it, that one is supposed to look like a bot
 local function tapDurSec()
-    if not humanize or perfected then return TAP_DUR end
+    if not humanize or perfected or not hHumanTaps then return TAP_DUR end
     return math.clamp(TAP_DUR + (math.random()-0.5)*0.03, 0.03, 0.09)
 end
 
-local function vimTap(lane)
+local function vimTap(lane, dur)
     vimUp(lane); vimDown(lane)
     pressSeq[lane] = pressSeq[lane] + 1
     local mine = pressSeq[lane]
-    task.delay(tapDurSec(), function()
+    task.delay(dur or tapDurSec(), function()
         -- only the newest press on a lane gets to let go, so an old tap can't
         -- cut a hold or a newer tap short
         if pressSeq[lane] == mine then vimUp(lane) end
@@ -371,24 +440,6 @@ local function stopHold(lane, interrupted)
     laneHoldFrame[lane]=nil
     vimUp(lane)
     if interrupted then resetLnHold(lane) end
-end
-
-local function holdForDuration(lane, holdFrame, spd, pressedAt)
-    laneHoldFrame[lane] = holdFrame
-    pressSeq[lane] = pressSeq[lane] + 1  -- this press owns the key now
-    local scale   = math.abs(holdFrame.Size.Y.Scale)
-    local p88     = scale / (5.5*spd) + 0.07
-    local leadSec = vimLatencyMs / 1000
-    local elapsed = tick() - pressedAt
-    local rem     = math.max(0, p88 - leadSec - elapsed)
-    if humanize then
-        -- real fingers let go a hair late, never early. letting go early is
-        -- what breaks the combo on a hold, so this only ever adds time
-        rem = rem + (0.005 + math.random()*0.025)
-    end
-    task.delay(rem, function()
-        if laneHoldFrame[lane] == holdFrame then stopHold(lane,false) end
-    end)
 end
 
 -- ════════════════════════════════════════════════════════════
@@ -431,23 +482,16 @@ end
 -- ════════════════════════════════════════════════════════════
 -- advanced bp: humanize engine
 -- ────────────────────────────────────────────────────────────
--- instead of picking a rating word first, this samples a continuous timing
--- error (ms, late only, early hits aren't modeled) shaped by a few layered
--- human effects. whatever band the error lands in IS the rating.
+-- the player decides an error for every note before it lands (ms, + = late,
+-- - = early) and the hands (further down) press at exactly that moment. the
+-- error is built from a few layers and every layer is its own switch on the
+-- advanced tab. whatever band the error lands in IS the rating.
 -- ════════════════════════════════════════════════════════════
 local function gaussianRandom()
     -- box-muller, gives a standard normal sample (mean 0, sd 1)
     local u1 = math.max(1e-9, math.random())
     local u2 = math.random()
     return math.sqrt(-2*math.log(u1)) * math.cos(2*math.pi*u2)
-end
-
--- accuracy slider → base mean/spread of the timing error, in ms
-local function baseTimingFromAccuracy()
-    local t = (100 - hAccuracy) / 100       -- 0 = flawless, 1 = sloppiest
-    local mean  = 2  + 68 * (t^1.3)
-    local sigma = 4  + 51 * (t^1.1)
-    return mean, sigma
 end
 
 -- consistency slider → how much a hot/cold streak carries into the next note
@@ -473,48 +517,159 @@ local function trackAndGetOverflow()
     return math.max(0, (#kpsLog - fingerSpeedLimit)/fingerSpeedLimit)
 end
 
--- the main roll: how late (ms) this press should land, and whether it should
--- just whiff for real. jackGap = seconds since this lane was last pressed
--- (small = a jack)
-local function computeHumanizeOffsetMs(jackGap)
-    updateStreak()
-    local mean, sigma = baseTimingFromAccuracy()
+-- ── the player's state ───────────────────────────────────────
+local hDrift, hFocus, hTilt   = 0, 0, 0           -- slow timing wander, attention, "just slipped"
+local hLaneBias               = {0,0,0,0}         -- each finger's own habit, ms
+local hChordDir               = 1                 -- which way a chord rolls
+local hLastNoise, hLastNoiseT = 0, 0
+local hLastT                  = nil
+local H_PLAN                  = 0.45              -- decide each note this long before it lands
+local hPlan                   = setmetatable({}, {__mode="k"})  -- note -> {e=ms, density=}
+local hHold                   = {}                -- release plan for the hold each lane is on
+local hLaneHit                = {-math.huge,-math.huge,-math.huge,-math.huge}  -- when the last planned note in each lane lands
+local hAnyHit                 = -math.huge
+local hHitHist                = {}                -- landing times of recent notes, for how busy it is
 
-    if hJackFatigue and jackGap < 0.22 then
-        local f = (0.22-jackGap)/0.22        -- 0..1, 1 = instant re-press
-        mean  = mean  + f*22
-        sigma = sigma * (1 + f*0.9)
+-- a fresh start for the player. runs on enable and every time a song starts,
+-- so each attempt has its own lean, habits and warm-up
+local function hResetRun()
+    songStartTick  = tick()
+    streakState    = 0
+    table.clear(kpsLog)
+    table.clear(pressLog)
+    personalBiasMs = gaussianRandom() * 2.5
+    for i=1,4 do hLaneBias[i] = gaussianRandom() * 2.2 end
+    hChordDir = (math.random() < 0.5) and 1 or -1
+    hDrift, hFocus, hTilt = 0, 0, 0
+    hLastNoise, hLastNoiseT, hLastT = 0, 0, nil
+    hHold = {}
+    for i=1,4 do hLaneHit[i] = -math.huge end
+    hAnyHit = -math.huge
+    table.clear(hHitHist)
+end
+
+-- moves the slow stuff forward in real time
+local function hAdvance(now)
+    local dt = hLastT and math.min(now - hLastT, 3) or 0
+    hLastT = now
+    if dt <= 0 then return end
+    if hDriftOn then
+        -- the timing average wanders a few ms and drifts back, faster to
+        -- wander when consistency is low
+        local k = math.exp(-dt/8)
+        hDrift = hDrift*k + (1 + 6*(1 - hConsistency/100)) * math.sqrt(1-k*k) * gaussianRandom()
+    end
+    if hFocusOn then
+        local k = math.exp(-dt/25)
+        hFocus = math.clamp(hFocus*k + math.sqrt(1-k*k) * gaussianRandom() * 0.7, -1.5, 1.5)
+    end
+    hTilt = hTilt * math.exp(-dt/1.6)  -- a slip fades out
+end
+
+-- the decision for one note. returns the error in ms, or nil if the note
+-- gets dropped. c = {lane, now, gapPrev, restGap, density, chordSize}
+local function hDecide(c)
+    local now = c.now
+    hAdvance(now)
+
+    -- simple mode: pick a rating from the weights and land somewhere inside it
+    if not humanize then
+        local rating = pickRating()
+        if rating == "miss" then return nil end
+        local off = math.min(randomOffsetForRating(rating), 125)
+        return (math.random() < 0.5) and -off or off
     end
 
+    local acc     = hAccuracy
+    local t       = (100 - acc) / 100
+    local sigma   = 4 + 51 * t^1.1       -- how scattered, ms
+    local mean    = 1 + 40 * t^1.4       -- sloppier players land later on average, ms
+    local comfort = 5 + 0.14 * acc       -- notes a second this player handles fine
+    local dmul    = 1
+
+    if hJackFatigue then
+        dmul = 1 + 1.2 * math.max(0, c.density/comfort - 0.6)^1.3
+        if c.gapPrev < 0.22 then  -- same finger again, fast
+            local f = (0.22 - c.gapPrev) / 0.22
+            mean  = mean + f*14
+            sigma = sigma * (1 + f*0.8)
+        end
+        if c.chordSize >= 3 then sigma = sigma * 1.15 end
+    end
+    if hRush then
+        mean = mean - math.min(6, 0.35 * math.max(0, c.density - 0.5*comfort))
+    end
+    sigma = sigma * dmul
+
     if hWarmupFatigue then
-        local elapsed = tick() - songStartTick
+        local elapsed = now - songStartTick
         if elapsed < 2.5 then
             sigma = sigma * (1 + 0.6*(1 - elapsed/2.5))
         elseif elapsed > 90 then
             sigma = sigma * (1 + math.min(0.25, (elapsed-90)/300))
         end
     end
+    if hFocusOn then sigma = sigma * (1 - 0.12*hFocus) end
+    if hColdStart and c.restGap > 1.5 then
+        sigma = sigma * 1.3
+        mean  = mean + 4
+    end
+    local spike = hReactToSpikes and chartIsInSpikeWindow and chartIsInSpikeWindow()
+    if spike then sigma = sigma * 1.25 end
 
-    local realMiss = false
     local overflow = trackAndGetOverflow()
     if overflow > 0 then
-        mean  = mean  + overflow*45
+        mean  = mean + overflow*45
         sigma = sigma * (1 + overflow*2.5)
-        if hAllowRealMiss and overflow > 0.5 and math.random() < math.min(0.35, overflow*0.15) then
-            realMiss = true
+    end
+    if hStreaks then
+        updateStreak()
+        sigma = sigma * (1 + streakState*0.5)
+    end
+    if hTiltOn then sigma = sigma * (1 + 0.6*hTilt) end
+    sigma = math.max(1.5, sigma)
+
+    -- where this player's timing sits right now
+    local bias = hLeanMs
+    if hPersonalBias then bias = bias + personalBiasMs end
+    if hFingerBias   then bias = bias + hLaneBias[c.lane] end
+    if hDriftOn      then bias = bias + hDrift end
+
+    local noise = gaussianRandom() * sigma
+    local corr = 0
+    if hSelfCorrect and now - hLastNoiseT < 0.6 then corr = -0.25 * hLastNoise end
+    hLastNoise, hLastNoiseT = noise, now
+    local e = noise + mean + bias + corr
+
+    -- slips: the odd bigger error, or a note that just doesn't get hit
+    local slipped, missed = false, false
+    if hSlips then
+        local p = (hMistakes/100) * 0.012 * (1 + (100-acc)/40) * dmul
+        if hTiltOn  then p = p * (1 + 1.5*hTilt) end
+        if hFocusOn then p = p * (1 - 0.3*hFocus) end
+        if spike    then p = p * 1.5 end
+        if math.random() < math.min(p, 0.3) then
+            slipped = true
+            if hAllowRealMiss and math.random() < 0.35 then
+                missed = true
+            else
+                local mag = 18 + math.abs(gaussianRandom()) * (1.5*sigma + 10)
+                e = e + ((math.random() < 0.65) and mag or -mag)
+            end
         end
     end
-
-    if hReactToSpikes and chartIsInSpikeWindow and chartIsInSpikeWindow() then
-        sigma = sigma * 1.25
+    if not missed and hAllowRealMiss and overflow > 0.5
+       and math.random() < math.min(0.35, overflow*0.15) then
+        missed = true
     end
 
-    -- the streak modulates spread (a bad run looks scattered, not just late)
-    sigma = math.max(1.5, sigma * (1 + streakState*0.5))
+    if hTiltOn and (missed or slipped or math.abs(e) > 40) then
+        hTilt = math.min(2, hTilt + (missed and 0.8 or 0.5))
+    end
+    if missed then return nil end
 
-    local personal = hPersonalBias and personalBiasMs or 0
-    local raw = gaussianRandom()*sigma + mean + personal
-    return math.clamp(raw, 0, 165), realMiss
+    if not hEarlyHits then e = math.abs(e) end
+    return math.clamp(e, -110, 125)
 end
 
 local function getMyKeySync()
@@ -643,13 +798,9 @@ local function installChartScanHook()
             if type(sP[fnName]) == "function" then
                 local original = sP[fnName]
                 sP[fnName] = function(songModule, ...)
-                    local epoch = tick()
-                    -- fresh "run" feel every song, not just on enable. a real
-                    -- player's warm-up and personal lean reset per attempt
-                    songStartTick  = epoch
-                    personalBiasMs = hPersonalBias and (math.random()*8) or 0
-                    streakState    = 0
-                    table.clear(kpsLog)
+                    -- fresh start every song, not just on enable. a real
+                    -- player's warm-up, lean and habits reset per attempt
+                    hResetRun()
 
                     -- the 2nd arg after songModule is the side the game plays (1 or 2)
                     local extra = {...}
@@ -852,61 +1003,228 @@ local function perfectStep(dt)
 end
 
 -- ════════════════════════════════════════════════════════════
--- note handler !!!
+-- the player's hands
+-- ────────────────────────────────────────────────────────────
+-- uses the same note tracking as perfect mode. each note gets decided once,
+-- ahead of time (hDecide), then pressed on the frame that lands closest to
+-- the error it was given. holds are let go the way they were planned
 -- ════════════════════════════════════════════════════════════
-local function handleNote(lane, isHold, holdFrame, arrowFrame, spd, chordDelayMs)
-    chordDelayMs = chordDelayMs or 0
-    local now = tick()
-    local jackGap = now - (lastLaneTime[lane] or 0)
-    lastLaneTime[lane] = now
+local function humanTapDur(gapNext, density)
+    -- a real tap is 40 to 90ms down, quicker when the notes come quicker, and
+    -- it can't be longer than the gap to the next note in the lane
+    local d = 0.055 * (0.75 + 0.6*math.random()) / (1 + 0.02*(density or 0))
+    return math.clamp(d, 0.025, math.max(0.025, (gapNext or 1) * 0.6))
+end
 
-    if missJacks and jackGap < 0.12 then
-        return  -- intentionally whiffs fast same-key repeats, like a stumbling finger
-    end
-
-    if laneHoldFrame[lane] then stopHold(lane,true) end
-
-    local function fire()
-        local pressedAt = tick()
-        if isHold then
-            local sc = holdFrame and math.abs(holdFrame.Size.Y.Scale) or 0
-            if sc < 0.01 then   -- short hold (blue note), just tap it
-                vimTap(lane)
-            else
-                vimUp(lane); vimDown(lane)
-                holdForDuration(lane, holdFrame, spd, pressedAt)
+-- how a hold gets let go. normally a little after the earliest moment the
+-- game would count it as done. every so often too soon, which breaks it
+local function hHoldPlan(hf, now, dir, fallbackV)
+    local plan = {t0=now, relThr=1.3}
+    if humanize and hHumanHolds then
+        local late = math.clamp(0.035 + gaussianRandom()*0.03, 0, 0.12)
+        plan.relThr = math.clamp(1.35 - fallbackV*late, -0.5, 1.35)
+        if hAllowRealMiss and hSlips then
+            local crit0 = math.abs(hf.Size.Y.Scale) + hf.Position.Y.Scale * dir
+            if crit0 - 1.5 > 0.4 then
+                local p = (hMistakes/100) * 0.02 * (1 + (100-hAccuracy)/40)
+                if hTiltOn then p = p * (1 + 1.5*hTilt) end
+                if math.random() < math.min(0.25, p) then
+                    plan.dropThr = crit0 - (0.15 + math.random()*0.7) * (crit0 - 1.5)
+                    if hTiltOn then hTilt = math.min(2, hTilt + 0.5) end
+                end
             end
+        end
+    end
+    return plan
+end
+
+local function hPress(lane, note, nf, e, gapNext, density, now, dir, fallbackV)
+    pressLog[#pressLog+1] = {t=now, e=e}
+    if #pressLog > 8 then table.remove(pressLog, 1) end
+    if laneHoldFrame[lane] then stopHold(lane, true) end
+    local holdFrame = nil
+    if note:GetAttribute("HoldHead") == true then
+        holdFrame = nf:FindFirstChild("Hold_"..note.Name)
+        if holdFrame and math.abs(holdFrame.Size.Y.Scale) < 0.01 then holdFrame = nil end
+    end
+    if holdFrame then
+        vimUp(lane); vimDown(lane)
+        pressSeq[lane] = pressSeq[lane] + 1
+        laneHoldFrame[lane] = holdFrame
+        hHold[lane] = hHoldPlan(holdFrame, now, dir, fallbackV)
+    else
+        vimTap(lane, (humanize and hHumanTaps) and humanTapDur(gapNext, density) or nil)
+    end
+end
+
+-- decides the notes that landed in the same instant together, as a chord
+local function hPlanGroup(group, all, now)
+    table.sort(group, function(a, b) return a.lane < b.lane end)
+    local rem0  = group[1].rem
+    local hitT0 = now + rem0
+
+    -- how busy it is around this note, in notes a second (counting the ones
+    -- already played)
+    local count = 0
+    for _, o in ipairs(all) do
+        if math.abs(o.rem - rem0) <= 0.4 then count = count + 1 end
+    end
+    for _, ht in ipairs(hHitHist) do
+        if ht <= now and ht >= hitT0 - 0.4 then count = count + 1 end
+    end
+    local density = count / 0.8
+    local restGap = hitT0 - hAnyHit
+
+    local es = {}
+    for k, it in ipairs(group) do
+        local gapPrev = (now + it.rem) - hLaneHit[it.lane]
+        if missJacks and gapPrev < 0.12 then
+            es[k] = false  -- stumbles on a fast same-key repeat, on purpose
         else
-            vimTap(lane)
+            es[k] = hDecide({lane=it.lane, now=now, gapPrev=gapPrev, restGap=restGap,
+                             density=density, chordSize=#group}) or false
         end
     end
 
-    if humanize then
-        task.spawn(function()
-            local offsetMs, realMiss = computeHumanizeOffsetMs(jackGap)
-            if realMiss then return end
-            local delaySec = (offsetMs + chordDelayMs)/1000
-            if delaySec > 0 then task.wait(delaySec) end
-            fire()
-        end)
-    else
-        local rating = pickRating()
-        if rating=="miss" then return end
-        task.spawn(function()
-            local delaySec = (randomOffsetForRating(rating) + chordDelayMs)/1000
-            if delaySec > 0 then task.wait(delaySec) end
-            fire()
-        end)
+    -- a chord is one hand movement: the fingers share most of the error and
+    -- land a few ms apart
+    if humanize and hChordStagger and #group > 1 then
+        local ec = nil
+        for k = 1, #group do if es[k] then ec = es[k]; break end end
+        if ec then
+            local st, total = {}, 0
+            for m = 1, #group do
+                local rank = (hChordDir > 0) and m or (#group - m + 1)
+                st[m] = (rank - 1) * (3 + math.random()*7)
+                total = total + st[m]
+            end
+            for m = 1, #group do
+                if es[m] then es[m] = ec + (es[m] - ec)*0.35 + (st[m] - total/#group) end
+            end
+        end
+    end
+
+    while #hHitHist > 0 and hHitHist[1] < now - 1 do table.remove(hHitHist, 1) end
+    for k, it in ipairs(group) do
+        if es[k] then
+            hPlan[it.note] = {e=es[k], density=density}
+        else
+            pfDone[it.note] = true  -- left alone, the game counts it as a miss
+        end
+        hLaneHit[it.lane] = now + it.rem
+        hHitHist[#hHitHist+1] = now + it.rem
+    end
+    hAnyHit = math.max(hAnyHit, hitT0)
+end
+
+local function humanStep(dt)
+    if not v8 or perfected then return end
+    pfDt = math.clamp(pfDt*0.9 + math.min(dt or pfDt, 0.05)*0.1, 0.004, 0.05)
+    local KS = getMyKeySync()
+    if not (KS and KS.Visible) then return end
+    local now = tick()
+    local S = _G.Settings or {}
+    local dir = tonumber(S.Direction) or 1
+    local fallbackV = math.max(1, 5.5 * (tonumber(S.NoteSpeed) or 2))
+    -- time between our press and the frame the game reads the note on. the
+    -- latency slider (or auto latency) sets this, same meaning as always:
+    -- bigger slider = press later
+    local lead = math.clamp((130.5 - vimLatencyMs) / 1000, 0, 0.25)
+    local dtHalf = pfDt / 2
+
+    -- every lane: the notes that are close, nearest first
+    local lanes, all = {}, {}
+    for lane=1,4 do
+        local af = KS:FindFirstChild("Arrow"..lane)
+        local nf = af and af:FindFirstChild("Notes")
+        local list = {}
+        if nf then
+            for _, c in ipairs(nf:GetChildren()) do
+                if c:IsA("GuiObject") and c.Visible and c.Name:sub(1,5) ~= "Hold_" and not pfDone[c] then
+                    local rem = pfRemaining(c, c.Position.Y.Scale, now, fallbackV)
+                    if rem < -PF_LATE then
+                        pfDone[c] = true
+                    elseif rem < 1.0 then
+                        local item = {note=c, rem=rem, lane=lane}
+                        list[#list+1] = item
+                        all[#all+1] = item
+                    end
+                end
+            end
+            table.sort(list, function(a, b) return a.rem < b.rem end)
+        end
+        lanes[lane] = {nf=nf, list=list}
+    end
+    table.sort(all, function(a, b) return a.rem < b.rem end)
+
+    -- decide the notes that just came inside the planning window
+    local i = 1
+    while i <= #all do
+        local it = all[i]
+        if it.rem > H_PLAN then break end
+        if hPlan[it.note] or pfDone[it.note] then
+            i = i + 1
+        else
+            local group = {it}
+            local j = i + 1
+            while j <= #all and all[j].rem - it.rem <= 0.012 do
+                if not hPlan[all[j].note] and not pfDone[all[j].note] then group[#group+1] = all[j] end
+                j = j + 1
+            end
+            hPlanGroup(group, all, now)
+            i = j
+        end
+    end
+
+    for lane=1,4 do
+        local nf, list = lanes[lane].nf, lanes[lane].list
+        if nf then
+            -- let go of a hold the way it was planned
+            local hf = laneHoldFrame[lane]
+            if hf then
+                local hp = hHold[lane] or {t0=now, relThr=1.3}
+                local held = now - hp.t0
+                local release = held > 15 or not hf.Parent
+                if not release then
+                    local crit = math.abs(hf.Size.Y.Scale) + hf.Position.Y.Scale * dir
+                    release = crit <= (hp.dropThr or hp.relThr)
+                end
+                if release and held > 0.03 then stopHold(lane, false) end
+            end
+
+            -- press whatever is due, oldest first
+            local k, pressed = 1, 0
+            while k <= #list and pressed < 4 do
+                local it = list[k]
+                if pfDone[it.note] then
+                    k = k + 1
+                else
+                    local p = hPlan[it.note]
+                    if not p then break end  -- not decided yet, still too far out
+                    if it.rem <= lead - p.e/1000 + dtHalf then
+                        pfDone[it.note] = true
+                        local nxt = nil
+                        for m = k+1, #list do
+                            if not pfDone[list[m].note] then nxt = list[m]; break end
+                        end
+                        hPress(lane, it.note, nf, p.e, nxt and (nxt.rem - it.rem) or 1, p.density, now, dir, fallbackV)
+                        pressed = pressed + 1
+                        k = k + 1
+                    else
+                        break
+                    end
+                end
+            end
+        end
     end
 end
 
 -- ════════════════════════════════════════════════════════════
 -- main loop
 -- ────────────────────────────────────────────────────────────
--- sv support: spd is read from _G.Settings.NoteSpeed every frame
--- lag spike recovery: scans up to 2x the trigger window so notes that
--- drifted past the normal trigger during a frame drop still get caught
--- instead of missed
+-- perfect mode presses on the frame closest to the hit and ignores
+-- everything else. any other time the player (humanize, or the hit chance
+-- weights with humanize off) decides and presses
 -- ════════════════════════════════════════════════════════════
 startLoop = function()
     if mainLoop then mainLoop:Disconnect(); mainLoop=nil end
@@ -915,74 +1233,6 @@ startLoop = function()
         if laneHoldFrame[i] then stopHold(i,false) end
         vimUp(i)
     end
-    seenNotes={}
-    local cacheBuilt={}
-
-    local function tick_fn()
-        if not v8 then return end
-        local KS = getMyKeySync()
-        if not (KS and KS.Visible) then return end
-
-        -- sv: re-read speed every frame (which SHOULD handle mid-song sv changes)
-        local spd = math.clamp(
-            tonumber((_G and _G.Settings and _G.Settings.NoteSpeed) or 2) or 2,
-            0.5, 10)
-        local trigger  = calcTriggerScale(spd)
-        -- this is what i call the RESCUE WINDOW, it catches notes that slipped past trigger during lag spikes
-        -- capped at half the perfect window so we don't fire too early (i havent tested this at all btw)
-        local rescue   = math.min(trigger * 1.8, 0.71775 * spd)
-
-        -- pass 1: collect every lane with a note to press this tick, so
-        -- chords (several lanes at once) can be told apart from solo notes
-        local toPress = {}
-        for lane=1,4 do
-            local af = KS:FindFirstChild("Arrow"..lane)
-            local nf = af and af:FindFirstChild("Notes")
-            if not (af and nf) then continue end
-
-            if not cacheBuilt[lane] then
-                cacheBuilt[lane]=true
-                nf.ChildAdded:Connect(function(c)
-                    c.AncestryChanged:Connect(function()
-                        if not c:IsDescendantOf(game) then seenNotes[c]=nil end
-                    end)
-                end)
-            end
-
-            local best, bestDist = nil, math.huge
-            for _, c in ipairs(nf:GetChildren()) do
-                if not c:IsA("GuiObject") then continue end
-                if c.Name:sub(1,5)=="Hold_" then continue end
-                if not c.Visible then continue end
-                if seenNotes[c] then continue end
-                local d = math.abs(c.Position.Y.Scale)
-                if d <= rescue and d < bestDist then
-                    bestDist=d; best=c
-                end
-            end
-
-            if not best then continue end
-            seenNotes[best]=true
-
-            local isHold    = best:GetAttribute("HoldHead")==true
-            local holdFrame = isHold and nf:FindFirstChild("Hold_"..best.Name) or nil
-            if isHold and not holdFrame then isHold=false end
-
-            toPress[#toPress+1] = {lane=lane, isHold=isHold, holdFrame=holdFrame, af=af}
-            best.AncestryChanged:Once(function() seenNotes[best]=nil end)
-        end
-
-        -- pass 2: fire. chord-mates (2nd+ lane this tick) get a tiny human stagger
-        local isChord = #toPress > 1
-        for i, p in ipairs(toPress) do
-            local chordDelayMs = 0
-            if isChord and humanize and hChordStagger and i > 1 then
-                chordDelayMs = math.abs(p.lane - toPress[1].lane) * (3 + math.random()*6)
-            end
-            handleNote(p.lane, p.isHold, p.holdFrame, p.af, spd, chordDelayMs)
-        end
-    end
-
     if perfected then
         -- perfect mode takes over completely. the old auto latency is shut
         -- off and none of the humanize stuff is touched
@@ -992,7 +1242,7 @@ startLoop = function()
     else
         stopPerfectMode()
         if autoLatency then startAutoLatency() end
-        mainLoop = RunService.Heartbeat:Connect(function() tick_fn() end)
+        mainLoop = RunService.RenderStepped:Connect(humanStep)
     end
 end
 
@@ -1019,7 +1269,7 @@ iR:AddLabel("IR1",{Text="<font color='#C41E3A'><b>botplay tab</b></font>"})
 iR:AddLabel("IR2",{Text="enable → turns botplay on or off\nperfect mode → a true 100%, presses every note on the exact frame it lands. overrides everything else while it's on\ntile lights → lights up the on-screen keys for looks\nmiss jacks → skips super-fast repeat notes so it doesn't stumble\nauto latency → watches your timing and adjusts itself, no setup needed\nvim latency → a manual timing offset, only used when auto latency is off\nhit chances → weights, not percentages, only used while humanize is off"})
 iR:AddSeparator("IRS1",{})
 iR:AddLabel("IR3",{Text="<font color='#D0D0D6'><b>advanced bp tab</b></font>"})
-iR:AddLabel("IR3B",{Text="humanize → plays with realistic, human-like timing instead of frame-perfect inputs\naccuracy & consistency → how good, and how steady, this 'player' is\ndifficulty scanner → points out a song's hardest sections the moment it loads"})
+iR:AddLabel("IR3B",{Text="humanize → plays with realistic, human-like timing instead of frame-perfect inputs. every part of it is its own switch, so mix and match\nskill preset, accuracy, consistency, mistakes → how good, and how steady, this 'player' is\ndifficulty scanner → points out a song's hardest sections the moment it loads"})
 iR:AddSeparator("IRS2",{})
 iR:AddLabel("IR5",{Text="<font color='#C41E3A'><b>works with</b></font>\n✓ mid-song speed changes\n✓ up & down scroll charts\n✓ modded charts\n✓ smooth at high fps, and still keeps up if your fps drops\n✓ hold notes and short (blue) notes"})
 
@@ -1035,11 +1285,8 @@ pL:AddToggle("Enable",{
         if v8 then
             laneHoldFrame={nil,nil,nil,nil}; lanePressed={false,false,false,false}
             for i=1,4 do vimUp(i) end
-            seenNotes={}; startLoop()
-            songStartTick  = tick()
-            personalBiasMs = hPersonalBias and (math.random()*8) or 0
-            streakState    = 0
-            table.clear(kpsLog)
+            hResetRun()
+            startLoop()
             window:Notification({Title="botplay",Text="<font color='#C41E3A'><b>on</b></font>",Duration=2})
         else
             for i=1,4 do
@@ -1050,7 +1297,6 @@ pL:AddToggle("Enable",{
             stopAutoLatency()
             stopPerfectMode()
             laneHoldFrame={nil,nil,nil,nil}; lanePressed={false,false,false,false}
-            seenNotes={}
             window:Notification({Title="botplay",Text="off",Duration=2})
         end
     end,
@@ -1137,29 +1383,64 @@ aL:AddToggle("Humanize",{
     end,
 })
 
-aL:AddSlider("Accuracy",{
+local presetNames = {"custom","casual","average","skilled","pro","elite"}
+local presets = {
+    casual  = {acc=55, cons=40, mist=70},
+    average = {acc=72, cons=55, mist=50},
+    skilled = {acc=86, cons=65, mist=35},
+    pro     = {acc=94, cons=78, mist=22},
+    elite   = {acc=98, cons=88, mist=10},
+}
+local accSlider, consSlider, mistSlider
+
+aL:AddDropdown("SkillPreset",{
+    Text="skill preset", Values=presetNames, Value=1,
+    Tooltip="one tap setups for accuracy, consistency and mistakes. 'custom' leaves the sliders alone",
+    Callback=function(val)
+        local p = presets[(type(val)=="number") and presetNames[val] or val]
+        if not p then return end
+        hAccuracy, hConsistency, hMistakes = p.acc, p.cons, p.mist
+        for _, pair in ipairs({{accSlider,p.acc},{consSlider,p.cons},{mistSlider,p.mist}}) do
+            if pair[1] then pcall(function() pair[1]:SetValue(pair[2]) end) end
+        end
+    end,
+})
+
+accSlider = aL:AddSlider("Accuracy",{
     Text="accuracy", Min=0, Max=100, Value=92, Step=1,
     Tooltip="how good this 'player' is, higher means tighter, closer-to-perfect timing",
     Callback=function(v) hAccuracy=v end,
 })
 
-aL:AddSlider("Consistency",{
+consSlider = aL:AddSlider("Consistency",{
     Text="consistency", Min=0, Max=100, Value=70, Step=1,
     Tooltip="how steady it stays, lower lets it drift into little hot and cold streaks like a real player",
     Callback=function(v) hConsistency=v end,
+})
+
+mistSlider = aL:AddSlider("Mistakes",{
+    Text="mistakes", Min=0, Max=100, Value=35, Step=1,
+    Tooltip="how often it slips: a bigger error, a missed note, a dropped hold. 0 never slips",
+    Callback=function(v) hMistakes=v end,
+})
+
+aL:AddSlider("Lean",{
+    Text="timing lean (ms)", Min=-15, Max=15, Value=0, Step=1,
+    Tooltip="negative presses early on average, positive presses late. stacks with the personal quirk",
+    Callback=function(v) hLeanMs=v end,
 })
 
 aL:AddSeparator("ALS1",{})
 
 aL:AddToggle("JackFatigue",{
     Text="finger fatigue on fast bursts", Value=true,
-    Tooltip="rapid same-key notes get a little sloppier, like a real finger struggling to keep up",
+    Tooltip="busy sections and fast same-key repeats get sloppier, like a real hand struggling to keep up",
     Callback=function(val) hJackFatigue=val end,
 })
 
 aL:AddToggle("ChordStagger",{
     Text="chord finger stagger", Value=true,
-    Tooltip="notes landing on the same beat across lanes get pressed a few ms apart, not at the exact same instant",
+    Tooltip="notes landing on the same beat across lanes are pressed as one hand movement, a few ms apart, not at the exact same instant",
     Callback=function(val) hChordStagger=val end,
 })
 
@@ -1171,7 +1452,7 @@ aL:AddToggle("WarmupFatigue",{
 
 aL:AddToggle("PersonalBias",{
     Text="personal timing quirk", Value=true,
-    Tooltip="picks a small, consistent 'a touch behind today' lean each run, like a real player's habit",
+    Tooltip="picks a small, consistent lean each run (a touch early or a touch behind), like a real player's habit",
     Callback=function(val) hPersonalBias=val end,
 })
 
@@ -1184,8 +1465,8 @@ aL:AddSlider("FingerSpeed",{
 })
 
 aL:AddToggle("AllowRealMiss",{
-    Text="allow real misses on brutal bursts", Value=true,
-    Tooltip="lets truly insane speed cause an occasional genuine miss, not just a sloppy hit",
+    Text="allow real misses & dropped holds", Value=true,
+    Tooltip="lets it genuinely miss a note or let go of a hold too soon now and then. off = it never drops anything, it just gets sloppier",
     Callback=function(val) hAllowRealMiss=val end,
 })
 
@@ -1214,4 +1495,68 @@ aR:AddButton("ShowSpikes",{
             window:Notification({Title="song scanned",Text=buildScanMessage(lastScanResult),Duration=5})
         end
     end,
+})
+
+aR:AddSeparator("ARS2",{})
+aR:AddLabel("ARD",{Text="<font color='#D0D0D6'><b>human details</b></font>\neach one is its own switch, so mix and match. all of these only apply while humanize is on"})
+
+aR:AddToggle("EarlyHits",{
+    Text="hits can land early", Value=true,
+    Tooltip="real players hit early as well as late. off = it only ever lands late",
+    Callback=function(val) hEarlyHits=val end,
+})
+aR:AddToggle("TimingDrift",{
+    Text="timing drift", Value=true,
+    Tooltip="the timing average wanders a few ms over time, a bit ahead for a while, then a bit behind",
+    Callback=function(val) hDriftOn=val end,
+})
+aR:AddToggle("FocusWaves",{
+    Text="focus waves", Value=true,
+    Tooltip="attention comes and goes over tens of seconds: tighter when locked in, looser when it fades",
+    Callback=function(val) hFocusOn=val end,
+})
+aR:AddToggle("FingerHabits",{
+    Text="finger habits", Value=true,
+    Tooltip="each lane has its own small habit, one a hair early, another a hair late, re-rolled every song",
+    Callback=function(val) hFingerBias=val end,
+})
+aR:AddToggle("SelfCorrect",{
+    Text="self-correction", Value=true,
+    Tooltip="after a late press the next one comes a touch earlier, and the other way round, like a real player adjusting",
+    Callback=function(val) hSelfCorrect=val end,
+})
+aR:AddToggle("HotColdStreaks",{
+    Text="hot & cold streaks", Value=true,
+    Tooltip="runs of notes that are tighter than usual, then runs that are looser (consistency sets how streaky)",
+    Callback=function(val) hStreaks=val end,
+})
+aR:AddToggle("Rush",{
+    Text="rush on dense patterns", Value=true,
+    Tooltip="presses a touch early when the notes get dense, like a player getting ahead of the beat",
+    Callback=function(val) hRush=val end,
+})
+aR:AddToggle("ColdStart",{
+    Text="cold start after a break", Value=true,
+    Tooltip="the first notes after a long gap are sloppier, like a hand that went idle",
+    Callback=function(val) hColdStart=val end,
+})
+aR:AddToggle("Slips",{
+    Text="occasional slips", Value=true,
+    Tooltip="every so often a note lands well off (the mistakes slider sets how often). slips can also be full misses if real misses are allowed",
+    Callback=function(val) hSlips=val end,
+})
+aR:AddToggle("SlipsSnowball",{
+    Text="slips snowball", Value=true,
+    Tooltip="after a slip the next few notes are shakier, so mistakes come in clusters like they do for real",
+    Callback=function(val) hTiltOn=val end,
+})
+aR:AddToggle("HumanHolds",{
+    Text="human holds", Value=true,
+    Tooltip="holds are let go a little after the end, never on the exact frame, and now and then too soon (needs real misses on)",
+    Callback=function(val) hHumanHolds=val end,
+})
+aR:AddToggle("HumanTaps",{
+    Text="human tap length", Value=true,
+    Tooltip="how long a key stays down varies, shorter on fast patterns. shows up on the tile lights",
+    Callback=function(val) hHumanTaps=val end,
 })
