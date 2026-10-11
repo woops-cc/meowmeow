@@ -1,10 +1,26 @@
 -- ── loading the ui library ──
+-- the loader makes its own network request after it downloads, and that can
+-- fail or time out, so give it a couple of tries before giving up. the second
+-- link is the same file with a different url shape
+local LIBRARY_URLS = {
+    "https://raw.githubusercontent.com/Null-Cherry/Fire-Library/refs/heads/main/Loader.lua",
+    "https://raw.githubusercontent.com/Null-Cherry/Fire-Library/main/Loader.lua",
+}
+
 local function loadLibrary()
-    local ok, res = pcall(function()
-        return loadstring(game:HttpGet("https://raw.githubusercontent.com/Null-Cherry/Fire-Library/refs/heads/main/Loader.lua", true))()
-    end)
-    if ok and res then return res end
-    warn("[bfnf:r] couldn't load the ui library: " .. tostring(res))
+    local lastErr = "nothing ran"
+    for attempt = 1, 2 do
+        for i, url in ipairs(LIBRARY_URLS) do
+            local ok, res = pcall(function()
+                return loadstring(game:HttpGet(url, true))()
+            end)
+            if ok and res then return res end
+            lastErr = tostring(res)
+            warn(("[bfnf:r] ui library try %d.%d failed: %s"):format(attempt, i, lastErr))
+        end
+        if attempt < 2 then task.wait(1.5) end
+    end
+    warn("[bfnf:r] couldn't load the ui library: " .. lastErr)
     return nil
 end
 
@@ -33,7 +49,7 @@ local function guard(obj, label)
     end})
 end
 
-local VERSION = "v3.3-beta"  -- bump this each update, it shows in the footer
+local VERSION = "v3.3.1-beta"  -- bump this each update, it shows in the footer
 
 -- ── palette (galaxy collapse: crimson, ink black & white) ──
 local C_RED   = Color3.fromRGB(196, 30,  58)     -- crimson   #C41E3A
