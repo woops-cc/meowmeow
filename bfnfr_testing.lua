@@ -3,8 +3,8 @@
 -- fail or time out, so give it a couple of tries before giving up. the second
 -- link is the same file with a different url shape
 local LIBRARY_URLS = {
-    "https://raw.githubusercontent.com/Null-Cherry/Fire-Library/refs/heads/main/Loader.lua",
-    "https://raw.githubusercontent.com/Null-Cherry/Fire-Library/main/Loader.lua",
+    "https://raw.githubusercontent.com/woops-cc/meowmeow/refs/heads/main/Loader_testing.lua",
+    "https://raw.githubusercontent.com/woops-cc/meowmeow/main/Loader_testing.lua",
 }
 
 local function loadLibrary()
