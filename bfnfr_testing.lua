@@ -1,26 +1,37 @@
 -- ── loading the ui library ──
--- the loader makes its own network request after it downloads, and that can
--- fail or time out, so give it a couple of tries before giving up. the second
--- link is the same file with a different url shape
-local LIBRARY_URLS = {
-    "https://raw.githubusercontent.com/woops-cc/meowmeow/refs/heads/main/Loader_testing.lua",
-    "https://raw.githubusercontent.com/woops-cc/meowmeow/main/Loader_testing.lua",
-}
+-- the library's own loader goes first. if it fails (it was broken for a while
+-- by wrong github urls) the library file is fetched and set up directly, the
+-- same way the loader does it
+local LOADER_URL    = "https://raw.githubusercontent.com/Null-Cherry/Fire-Library/refs/heads/main/Loader.lua"
+local LIBRARY_USERS = {"Null-Cherry", "Its-Kawi"}
+
+local function viaLoader()
+    return loadstring(game:HttpGet(LOADER_URL, true))()
+end
+
+local function viaFile(user)
+    local genv = (getgenv and getgenv()) or _G
+    if genv.FireLibrary then return genv.FireLibrary end
+    local contents = game:HttpGet("https://raw.githubusercontent.com/"..user.."/Fire-Library/refs/heads/main/Files/Library.lua")
+    local first = contents:find("local", 1, true)
+    local stop  = first and contents:find(";", first, true)
+    if not stop then error("nothing usable came back") end
+    local src = "local parent = nil"..contents:sub(stop + 1).."\nreturn require(obj:FindFirstChildOfClass(\"ModuleScript\"))"
+    local fn, err = loadstring(src)
+    if not fn then error("the library file didn't compile: "..tostring(err)) end
+    return fn("FireLibrary")
+end
 
 local function loadLibrary()
-    local lastErr = "nothing ran"
-    for attempt = 1, 2 do
-        for i, url in ipairs(LIBRARY_URLS) do
-            local ok, res = pcall(function()
-                return loadstring(game:HttpGet(url, true))()
-            end)
-            if ok and res then return res end
-            lastErr = tostring(res)
-            warn(("[bfnf:r] ui library try %d.%d failed: %s"):format(attempt, i, lastErr))
-        end
-        if attempt < 2 then task.wait(1.5) end
+    local ok, res = pcall(viaLoader)
+    if ok and res then return res end
+    warn("[bfnf:r] the library loader failed ("..tostring(res).."), loading the library file directly")
+    for _, user in ipairs(LIBRARY_USERS) do
+        local ok2, res2 = pcall(viaFile, user)
+        if ok2 and res2 then return res2 end
+        warn(("[bfnf:r] loading the library from %s failed: %s"):format(user, tostring(res2)))
     end
-    warn("[bfnf:r] couldn't load the ui library: " .. lastErr)
+    warn("[bfnf:r] couldn't load the ui library")
     return nil
 end
 
@@ -49,7 +60,7 @@ local function guard(obj, label)
     end})
 end
 
-local VERSION = "v3.3.1-beta"  -- bump this each update, it shows in the footer
+local VERSION = "v3.4-beta"  -- bump this each update, it shows in the footer
 
 -- ── palette (galaxy collapse: crimson, ink black & white) ──
 local C_RED   = Color3.fromRGB(196, 30,  58)     -- crimson   #C41E3A
@@ -564,6 +575,18 @@ local function hResetRun()
     table.clear(hHitHist)
 end
 
+-- lets go of the hold on this lane when its plan says so. the plan is all
+-- timing (when the body of the hold ends), so it doesn't depend on how the
+-- hold frame moves around once the game grabs it
+local function hHoldTick(lane, now)
+    local hf = laneHoldFrame[lane]
+    if not hf then return end
+    local hp = hHold[lane] or {t0=now, endAt=now}
+    local held = now - hp.t0
+    local release = held > 15 or not hf.Parent or now >= (hp.dropAt or hp.endAt)
+    if release and held > 0.03 then stopHold(lane, false) end
+end
+
 -- moves the slow stuff forward in real time
 local function hAdvance(now)
     local dt = hLastT and math.min(now - hLastT, 3) or 0
@@ -591,9 +614,9 @@ local function hDecide(c)
     -- simple mode: pick a rating from the weights and land somewhere inside it
     if not humanize then
         local rating = pickRating()
-        if rating == "miss" then return nil end
+        if rating == "miss" then return nil, 8 end
         local off = math.min(randomOffsetForRating(rating), 125)
-        return (math.random() < 0.5) and -off or off
+        return ((math.random() < 0.5) and -off or off), 8
     end
 
     local acc     = hAccuracy
@@ -610,7 +633,7 @@ local function hDecide(c)
             mean  = mean + f*14
             sigma = sigma * (1 + f*0.8)
         end
-        if c.chordSize >= 3 then sigma = sigma * 1.15 end
+        if c.chordSize >= 2 then sigma = sigma * (1 + 0.06 * (c.chordSize - 1)) end
     end
     if hRush then
         mean = mean - math.min(6, 0.35 * math.max(0, c.density - 0.5*comfort))
@@ -633,7 +656,7 @@ local function hDecide(c)
     local spike = hReactToSpikes and chartIsInSpikeWindow and chartIsInSpikeWindow()
     if spike then sigma = sigma * 1.25 end
 
-    local overflow = trackAndGetOverflow()
+    local overflow = c.overflow or 0
     if overflow > 0 then
         mean  = mean + overflow*45
         sigma = sigma * (1 + overflow*2.5)
@@ -682,10 +705,10 @@ local function hDecide(c)
     if hTiltOn and (missed or slipped or math.abs(e) > 40) then
         hTilt = math.min(2, hTilt + (missed and 0.8 or 0.5))
     end
-    if missed then return nil end
+    if missed then return nil, sigma end
 
     if not hEarlyHits then e = math.abs(e) end
-    return math.clamp(e, -110, 125)
+    return math.clamp(e, -110, 125), sigma
 end
 
 local function getMyKeySync()
@@ -858,7 +881,6 @@ local pfDt           = 1/60    -- smoothed frame time
 local pfLastText     = nil
 local pfActive       = false
 local pfSavedHitLate = false
-local pfHeldAt       = {0,0,0,0}
 local pfTrack        = setmetatable({}, {__mode="k"})  -- per note movement samples
 local pfDone         = setmetatable({}, {__mode="k"})  -- notes already pressed or passed
 
@@ -943,6 +965,17 @@ local function pfRemaining(c, scale, now, fallbackV)
     return d / v
 end
 
+-- how fast this note is moving in scale units a second, measured the same way
+-- as pfRemaining. holds use it to work out how long their body takes to pass
+local function pfSpeed(c, fallbackV)
+    local s = pfTrack[c]
+    if s and s.cT - s.pT >= 0.05 then
+        local v = (s.pD - s.cD) / (s.cT - s.pT)
+        if v > 0.5 then return v end
+    end
+    return fallbackV
+end
+
 -- the note in this lane that is due first (skips hold bodies and notes
 -- already pressed)
 local function pfNearest(nf, now, fallbackV)
@@ -967,7 +1000,6 @@ local function perfectStep(dt)
     if not (KS and KS.Visible) then return end
     local now = tick()
     local S = _G.Settings or {}
-    local dir = tonumber(S.Direction) or 1
     local fallbackV = math.max(1, 5.5 * (tonumber(S.NoteSpeed) or 2))
 
     pfCalibrate(KS.Parent)
@@ -980,18 +1012,7 @@ local function perfectStep(dt)
         local af = KS:FindFirstChild("Arrow"..lane)
         local nf = af and af:FindFirstChild("Notes")
         if nf then
-            -- let go of a hold the moment the game counts it as finished.
-            -- same check the game runs when the key comes up: the hold's
-            -- size plus its position has to be 1.5 or less. 1.3 leaves room
-            local hf = laneHoldFrame[lane]
-            if hf then
-                local held = now - pfHeldAt[lane]
-                local done = held > 15 or not hf.Parent
-                if not done then
-                    done = math.abs(hf.Size.Y.Scale) + hf.Position.Y.Scale * dir <= 1.3
-                end
-                if done and held > 0.03 then stopHold(lane, false) end
-            end
+            hHoldTick(lane, now)
 
             -- press everything that's due this frame (fast jacks can have
             -- more than one note due at once)
@@ -1009,7 +1030,10 @@ local function perfectStep(dt)
                     vimUp(lane); vimDown(lane)
                     pressSeq[lane] = pressSeq[lane] + 1
                     laneHoldFrame[lane] = holdFrame
-                    pfHeldAt[lane] = now
+                    -- the body of the hold takes (its length / its speed) to
+                    -- pass the line once the head lands. let go just after that
+                    local body = math.abs(holdFrame.Size.Y.Scale) / pfSpeed(note, fallbackV)
+                    hHold[lane] = {t0=now, endAt=now + rem + body + 0.03}
                 else
                     vimTap(lane)
                 end
@@ -1032,29 +1056,28 @@ local function humanTapDur(gapNext, density)
     return math.clamp(d, 0.025, math.max(0.025, (gapNext or 1) * 0.6))
 end
 
--- how a hold gets let go. normally a little after the earliest moment the
--- game would count it as done. every so often too soon, which breaks it
-local function hHoldPlan(hf, now, dir, fallbackV)
-    local plan = {t0=now, relThr=1.3}
+-- how a hold gets let go. everything is timing: the body of a hold takes
+-- (its length / its speed) to pass the line after the head lands. normally
+-- a little after that, never on the exact frame. every so often too soon,
+-- which breaks it
+local function hHoldPlan(hf, now, hitT, vv)
+    local body = math.abs(hf.Size.Y.Scale) / vv
+    local plan = {t0=now, endAt=hitT + body + 0.03}
     if humanize and hHumanHolds then
-        local late = math.clamp(0.035 + gaussianRandom()*0.03, 0, 0.12)
-        plan.relThr = math.clamp(1.35 - fallbackV*late, -0.5, 1.35)
-        if hAllowRealMiss and hSlips then
-            local crit0 = math.abs(hf.Size.Y.Scale) + hf.Position.Y.Scale * dir
-            if crit0 - 1.5 > 0.4 then
-                local p = (hMistakes/100) * 0.02 * (1 + (100-hAccuracy)/40)
-                if hTiltOn then p = p * (1 + 1.5*hTilt) end
-                if math.random() < math.min(0.25, p) then
-                    plan.dropThr = crit0 - (0.15 + math.random()*0.7) * (crit0 - 1.5)
-                    if hTiltOn then hTilt = math.min(2, hTilt + 0.5) end
-                end
+        plan.endAt = hitT + body + math.clamp(0.035 + gaussianRandom()*0.03, 0, 0.12)
+        if hAllowRealMiss and hSlips and body > 0.25 then
+            local p = (hMistakes/100) * 0.02 * (1 + (100-hAccuracy)/40)
+            if hTiltOn then p = p * (1 + 1.5*hTilt) end
+            if math.random() < math.min(0.25, p) then
+                plan.dropAt = hitT + body * (0.15 + math.random()*0.7)
+                if hTiltOn then hTilt = math.min(2, hTilt + 0.5) end
             end
         end
     end
     return plan
 end
 
-local function hPress(lane, note, nf, e, gapNext, density, now, dir, fallbackV)
+local function hPress(lane, note, nf, e, gapNext, density, now, rem, fallbackV)
     pressLog[#pressLog+1] = {t=now, e=e}
     if #pressLog > 8 then table.remove(pressLog, 1) end
     if laneHoldFrame[lane] then stopHold(lane, true) end
@@ -1067,7 +1090,7 @@ local function hPress(lane, note, nf, e, gapNext, density, now, dir, fallbackV)
         vimUp(lane); vimDown(lane)
         pressSeq[lane] = pressSeq[lane] + 1
         laneHoldFrame[lane] = holdFrame
-        hHold[lane] = hHoldPlan(holdFrame, now, dir, fallbackV)
+        hHold[lane] = hHoldPlan(holdFrame, now, now + rem, pfSpeed(note, fallbackV))
     else
         vimTap(lane, (humanize and hHumanTaps) and humanTapDur(gapNext, density) or nil)
     end
@@ -1079,44 +1102,78 @@ local function hPlanGroup(group, all, now)
     local rem0  = group[1].rem
     local hitT0 = now + rem0
 
-    -- how busy it is around this note, in notes a second (counting the ones
-    -- already played)
-    local count = 0
+    -- how busy it is around this note, in hand movements a second. a chord is
+    -- one movement however many keys it has, so notes that land together only
+    -- count once. notes already played count too
+    local times = {}
     for _, o in ipairs(all) do
-        if math.abs(o.rem - rem0) <= 0.4 then count = count + 1 end
+        if math.abs(o.rem - rem0) <= 0.4 then times[#times+1] = now + o.rem end
     end
     for _, ht in ipairs(hHitHist) do
-        if ht <= now and ht >= hitT0 - 0.4 then count = count + 1 end
+        if ht <= now and ht >= hitT0 - 0.4 then times[#times+1] = ht end
+    end
+    table.sort(times)
+    local count, lastT = 0, -math.huge
+    for _, t in ipairs(times) do
+        if t - lastT > 0.012 then count = count + 1 end
+        lastT = t
     end
     local density = count / 0.8
     local restGap = hitT0 - hAnyHit
+    local size    = #group
+    -- a chord is one press for the finger speed limit, not one per key
+    local overflow = humanize and trackAndGetOverflow() or 0
+
+    local function ctx(it)
+        return {lane=it.lane, now=now, gapPrev=(now + it.rem) - hLaneHit[it.lane],
+                restGap=restGap, density=density, chordSize=size, overflow=overflow}
+    end
 
     local es = {}
-    for k, it in ipairs(group) do
-        local gapPrev = (now + it.rem) - hLaneHit[it.lane]
-        if missJacks and gapPrev < 0.12 then
-            es[k] = false  -- stumbles on a fast same-key repeat, on purpose
+    if size == 1 or not humanize then
+        for k, it in ipairs(group) do
+            es[k] = (hDecide(ctx(it))) or false
+        end
+    else
+        -- a chord is one hand movement: one decision for the whole thing and
+        -- every finger lands near it
+        local e1, sig = hDecide(ctx(group[1]))
+        if e1 == nil then
+            -- a slip: one finger lets go of its key, the others still land, a bit off
+            local drop = math.random(1, size)
+            for k = 1, size do
+                if k == drop then es[k] = false
+                else es[k] = math.clamp(gaussianRandom() * sig * 1.3 + 6, -110, 125) end
+            end
         else
-            es[k] = hDecide({lane=it.lane, now=now, gapPrev=gapPrev, restGap=restGap,
-                             density=density, chordSize=#group}) or false
+            for k = 1, size do
+                if k == 1 then es[k] = e1
+                else es[k] = math.clamp(e1 + gaussianRandom() * 0.35 * sig, -110, 125) end
+            end
+            -- every so often a bigger chord loses a finger
+            if hSlips and hAllowRealMiss and size >= 3
+               and math.random() < (hMistakes/100) * 0.012 * (size - 1) then
+                es[math.random(1, size)] = false
+            end
+        end
+        -- fingers land a few ms apart
+        if hChordStagger then
+            local st, total = {}, 0
+            for m = 1, size do
+                local rank = (hChordDir > 0) and m or (size - m + 1)
+                st[m] = (rank - 1) * (3 + math.random() * 7)
+                total = total + st[m]
+            end
+            for m = 1, size do
+                if es[m] then es[m] = es[m] + (st[m] - total / size) end
+            end
         end
     end
 
-    -- a chord is one hand movement: the fingers share most of the error and
-    -- land a few ms apart
-    if humanize and hChordStagger and #group > 1 then
-        local ec = nil
-        for k = 1, #group do if es[k] then ec = es[k]; break end end
-        if ec then
-            local st, total = {}, 0
-            for m = 1, #group do
-                local rank = (hChordDir > 0) and m or (#group - m + 1)
-                st[m] = (rank - 1) * (3 + math.random()*7)
-                total = total + st[m]
-            end
-            for m = 1, #group do
-                if es[m] then es[m] = ec + (es[m] - ec)*0.35 + (st[m] - total/#group) end
-            end
+    if missJacks then
+        for k, it in ipairs(group) do
+            -- stumbles on a fast same-key repeat, on purpose
+            if es[k] and (now + it.rem) - hLaneHit[it.lane] < 0.12 then es[k] = false end
         end
     end
 
@@ -1140,7 +1197,6 @@ local function humanStep(dt)
     if not (KS and KS.Visible) then return end
     local now = tick()
     local S = _G.Settings or {}
-    local dir = tonumber(S.Direction) or 1
     local fallbackV = math.max(1, 5.5 * (tonumber(S.NoteSpeed) or 2))
     -- time between our press and the frame the game reads the note on. the
     -- latency slider (or auto latency) sets this, same meaning as always:
@@ -1195,18 +1251,7 @@ local function humanStep(dt)
     for lane=1,4 do
         local nf, list = lanes[lane].nf, lanes[lane].list
         if nf then
-            -- let go of a hold the way it was planned
-            local hf = laneHoldFrame[lane]
-            if hf then
-                local hp = hHold[lane] or {t0=now, relThr=1.3}
-                local held = now - hp.t0
-                local release = held > 15 or not hf.Parent
-                if not release then
-                    local crit = math.abs(hf.Size.Y.Scale) + hf.Position.Y.Scale * dir
-                    release = crit <= (hp.dropThr or hp.relThr)
-                end
-                if release and held > 0.03 then stopHold(lane, false) end
-            end
+            hHoldTick(lane, now)
 
             -- press whatever is due, oldest first
             local k, pressed = 1, 0
@@ -1223,7 +1268,7 @@ local function humanStep(dt)
                         for m = k+1, #list do
                             if not pfDone[list[m].note] then nxt = list[m]; break end
                         end
-                        hPress(lane, it.note, nf, p.e, nxt and (nxt.rem - it.rem) or 1, p.density, now, dir, fallbackV)
+                        hPress(lane, it.note, nf, p.e, nxt and (nxt.rem - it.rem) or 1, p.density, now, it.rem, fallbackV)
                         pressed = pressed + 1
                         k = k + 1
                     else
