@@ -60,7 +60,7 @@ local function guard(obj, label)
     end})
 end
 
-local VERSION = "v3.5-beta"  -- bump this each update, it shows in the footer
+local VERSION = "v3.6-beta"  -- bump this each update, it shows in the footer
 
 -- ── palette (galaxy collapse: crimson, ink black & white) ──
 local C_RED   = Color3.fromRGB(196, 30,  58)     -- crimson   #C41E3A
@@ -409,34 +409,47 @@ end
 -- press method
 -- ────────────────────────────────────────────────────────────
 -- two ways to press a key:
---   vim:        VirtualInputManager sends a real key event. the engine queues
---               it, so the game only sees it a frame or so later
---   firesignal: calls the game's own key handler right now, with a fake key
---               event. the game only reads KeyCode and UserInputType off it,
---               so a plain table does the job. no queue, so less lag, and a
---               lag spike after the press can't push it late
--- it's a toggle on the botplay tab and it checks itself. no firesignal, one
--- that does nothing, or a game that doesn't react = it goes back to vim on
--- its own
+--   vim:  VirtualInputManager sends a real key event. the engine queues it,
+--         so the game only sees it a frame or so later
+--   fire: hands a fake key event straight to the game's key handler, right
+--         now. the game only reads KeyCode and UserInputType off it, so a
+--         plain table does the job. no queue, so less lag, and a lag spike
+--         after the press can't push it late
+-- executors differ on what actually reaches the game (on delta the plain
+-- firesignal reached our own listeners but not the game's), so fire has
+-- three routes to the game:
+--   all      calls every lua listener on InputBegan / InputEnded itself
+--   signal   firesignal(UserInputService.InputBegan, fake, false)
+--   handler  calls the game's own KeyPress / KeyLift functions
+-- when the toggle goes on it tests which routes reach the game, starts with
+-- the best one and checks that real notes get hit. a route that hits nothing
+-- gets skipped for the next one, and if none work it goes back to vim.
+-- it all lives in the one FS table because lua only allows 200 locals in a
+-- file and this script is already close to that
 -- ════════════════════════════════════════════════════════════
-local fireOn       = false   -- firesignal presses are switched on
-local fireBroken   = false   -- it didn't work here, so vim is used until the toggle is flipped again
-local fireBreakWhy = nil     -- why it broke, dealt with at the start of the next frame (a safe spot)
-local fireFailN    = 0       -- firesignal errors in a row
-local fireVerified = false   -- one note really got hit through it, so it's proven
-local fireMissN    = 0       -- watched presses that hit nothing, counted until one does
-local fireWatch    = {}      -- {note=, t=} presses waiting to be checked
-local fireReq      = 0       -- bumps on every toggle, so a slow self test can't undo a later switch
-local fireObjs     = {}      -- the fake key events, fireObjs[lane] = {down, up}
-local laneVia      = {}      -- how each lane's key went down, so it comes back up the same way
-local fireToggle             -- the ui toggle, assigned down in the ui part
-local applyPressMethod       -- forward declared, defined down in the main loop part
+local FS = {
+    on = false,           -- fire presses are switched on
+    broken = false,       -- gave up, vim is used until the toggle is flipped again
+    breakWhy = nil,       -- why it gave up, dealt with at the start of the next frame (a safe spot)
+    skipWhy = nil,        -- the route keeps erroring, move to the next one at the next safe spot
+    failN = 0,            -- route errors in a row
+    verified = false,     -- a real note got hit through the route, so it's proven
+    reported = false,     -- the "it's hitting notes" line was printed
+    missN = 0,            -- watched presses that hit nothing, counted until one does
+    watch = {},           -- {note=, t=} presses waiting to be checked
+    lastPress = -math.huge,
+    req = 0,              -- bumps on every toggle, so a slow setup can't undo a later switch
+    objs = {},            -- the fake key events, objs[lane] = {down, up}
+    via = {},             -- how each lane's key went down, so it comes back up the same way
+    routes = {}, routeI = 0, route = nil,   -- routes worth trying (best first) and the active one
+    handlers = {},        -- the game's own KeyPress / KeyLift
+    listeners = {down = {}, up = {}, at = 0},   -- every lua listener, cached
+    toggle = nil,         -- the ui toggle, set down in the ui part
+    apply = nil,          -- defined down in the main loop part
+    defaultKeys = {Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.W, Enum.KeyCode.D},
+}
 
--- the keys come from the game's own settings (primary bind first, then the
--- alt bind) so custom keybinds work. a s w d is only the fallback
-local DEFAULT_KEYS = {Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.W, Enum.KeyCode.D}
-
-local function fakeKey(key, state)
+function FS.fake(key, state)
     return {
         KeyCode        = key,
         UserInputType  = Enum.UserInputType.Keyboard,
@@ -446,10 +459,12 @@ local function fakeKey(key, state)
     }
 end
 
-local function refreshKeys()
+-- the keys come from the game's own settings (primary bind first, then the
+-- alt bind) so custom keybinds work. a s w d is only the fallback
+function FS.refreshKeys()
     local inputs = _G.Settings and _G.Settings.Inputs
     for lane = 1, 4 do
-        local key = DEFAULT_KEYS[lane]
+        local key = FS.defaultKeys[lane]
         if type(inputs) == "table" then
             for _, slot in ipairs({lane, lane + 4}) do
                 local ok, kc = pcall(function() return Enum.KeyCode[inputs[slot]] end)
@@ -457,41 +472,99 @@ local function refreshKeys()
             end
         end
         KEYS[lane] = key
-        fireObjs[lane] = {fakeKey(key, Enum.UserInputState.Begin), fakeKey(key, Enum.UserInputState.End)}
+        FS.objs[lane] = {FS.fake(key, Enum.UserInputState.Begin), FS.fake(key, Enum.UserInputState.End)}
     end
 end
-refreshKeys()
+FS.refreshKeys()
 
-local function fireBreak(why)
-    if fireBroken then return end
-    fireBroken = true
-    fireBreakWhy = why
+function FS.giveUp(why)
+    if FS.broken then return end
+    FS.broken = true
+    FS.breakWhy = why
 end
 
-local function fireKey(down, lane)
-    local pair = fireObjs[lane]
-    if not pair then return false end
-    local ok, err = pcall(firesignal, down and UIS.InputBegan or UIS.InputEnded, pair[down and 1 or 2], false)
-    if ok then fireFailN = 0; return true end
-    fireFailN = fireFailN + 1
-    if fireFailN >= 3 then fireBreak("firesignal keeps erroring: "..tostring(err)) end
-    return false
+function FS.info(f, what)
+    local ok, v = pcall(function() return debug.info(f, what) end)
+    if ok then return v end
 end
 
--- sends one key event and says how it went out ("fire" or "vim"), so the
--- release can go the same way
-local function sendKey(down, lane, via)
-    if via == nil then via = (fireOn and not fireBroken) and "fire" or "vim" end
-    if via == "fire" and fireKey(down, lane) then return "fire" end
-    VIM:SendKeyEvent(down, KEYS[lane], false, game)
-    return "vim"
+-- every lua listener on InputBegan / InputEnded (needs getconnections)
+function FS.scan()
+    local out = {down = {}, up = {}, at = tick()}
+    if type(getconnections) ~= "function" then return out end
+    for _, pair in ipairs({{UIS.InputBegan, out.down}, {UIS.InputEnded, out.up}}) do
+        local ok, conns = pcall(getconnections, pair[1])
+        if ok and type(conns) == "table" then
+            for _, c in ipairs(conns) do
+                local okf, f = pcall(function() return c.Function end)
+                local on = true
+                pcall(function() if c.Enabled == false then on = false end end)
+                if okf and type(f) == "function" and on then pair[2][#pair[2] + 1] = f end
+            end
+        end
+    end
+    return out
 end
 
--- some executors have a firesignal that exists but does nothing. this fires a
--- harmless fake key at our own listener and sees if it arrives
-local function fireSelfTest()
+-- the game's own KeyPress / KeyLift: by name from the listeners (the game
+-- ships its function names), or out of the songPlay module's globals as plan b
+function FS.findHandlers(L)
+    local found = {how = "listeners"}
+    local function pick(list, name)
+        for _, f in ipairs(list) do
+            if FS.info(f, "n") == name then
+                local src = FS.info(f, "s")
+                if type(src) ~= "string" or src:find("songPlay", 1, true) then return f end
+            end
+        end
+    end
+    found.down, found.up = pick(L.down, "KeyPress"), pick(L.up, "KeyLift")
+    if not (found.down and found.up) and type(getsenv) == "function" then
+        pcall(function()
+            for _, ch in ipairs(v5.PlayerGui.Main:GetChildren()) do
+                local sp = ch:IsA("LocalScript") and ch:FindFirstChild("songPlay")
+                if sp then
+                    local env = getsenv(sp)
+                    if type(env) == "table" and type(env.KeyPress) == "function" and type(env.KeyLift) == "function" then
+                        found.down, found.up, found.how = env.KeyPress, env.KeyLift, "getsenv"
+                    end
+                    break
+                end
+            end
+        end)
+    end
+    return found
+end
+
+-- sends one fake key event down a route. returns ok, err
+function FS.call(route, down, obj)
+    if route == "handler" then
+        local f = down and FS.handlers.down or FS.handlers.up
+        if not f then return false, "no handler" end
+        return pcall(f, obj, false)
+    elseif route == "all" then
+        if tick() - FS.listeners.at > 30 then
+            local s = FS.scan()
+            if #s.down > 0 then FS.listeners = s else FS.listeners.at = tick() end
+        end
+        local list = down and FS.listeners.down or FS.listeners.up
+        if #list == 0 then return false, "no listeners" end
+        local any, lastErr = false, nil
+        for _, f in ipairs(list) do
+            local ok, err = pcall(f, obj, false)
+            if ok then any = true else lastErr = err end
+        end
+        if any then return true end
+        return false, lastErr
+    end
+    return pcall(firesignal, down and UIS.InputBegan or UIS.InputEnded, obj, false)
+end
+
+-- does plain firesignal even reach a listener? (some executors have one that
+-- does nothing). it fires a harmless fake key at our own listener
+function FS.signalTest()
     if type(firesignal) ~= "function" then return false, "no firesignal in this executor" end
-    local probe = fakeKey(Enum.KeyCode.Unknown, Enum.UserInputState.Begin)
+    local probe = FS.fake(Enum.KeyCode.Unknown, Enum.UserInputState.Begin)
     probe.UserInputType = Enum.UserInputType.None
     local got = false
     local conn = UIS.InputBegan:Connect(function(inp) if inp == probe then got = true end end)
@@ -499,46 +572,79 @@ local function fireSelfTest()
     task.wait(0.1)   -- some executors run the listeners a moment later
     conn:Disconnect()
     if not ok then return false, "firesignal errored: "..tostring(err) end
-    if not got then return false, "firesignal didn't reach anything" end
+    if not got then return false, "firesignal didn't reach our own listener" end
     return true
 end
 
--- a hit note is destroyed on the spot, so a press that really landed makes
--- the note vanish. until firesignal has proven itself once, every press is
--- checked a moment later. if the first few never hit anything it goes back
--- to vim (the game isn't reacting to the fake keys)
-local function fireWatchAdd(note, now)
-    if not fireOn or fireBroken or fireVerified or #fireWatch >= 12 then return end
-    fireWatch[#fireWatch+1] = {note=note, t=now}
+-- does a route reach the game's own listeners? the game flips _G.Index.Device
+-- to "Computer" when a keyboard event hits its InputBegan listener. park it on
+-- something else, send a harmless fake key, see if it flipped, put it back.
+-- true / false, or nil when there's no way to tell
+function FS.reaches(route)
+    local idx = _G.Index
+    if type(idx) ~= "table" then return nil end
+    local prev = idx.Device
+    idx.Device = "bfnfr-probe"
+    local ok = FS.call(route, true, FS.fake(Enum.KeyCode.Unknown, Enum.UserInputState.Begin))
+    task.wait(0.1)
+    local reached = idx.Device ~= "bfnfr-probe"
+    idx.Device = prev
+    if not ok then return false end
+    return reached
 end
 
-local function fireHandleBreak()
-    local why = fireBreakWhy
-    fireBreakWhy = nil
-    warn("[bfnf:r] firesignal presses off: "..tostring(why))
-    applyPressMethod(false)
-    pcall(function() fireToggle:SetValue(false) end)
-    window:Notification({Title="firesignal", Text="didn't work here ("..tostring(why).."), back to the old way", Duration=5})
-end
-
-local function fireWatchStep(now)
-    if fireBreakWhy then fireHandleBreak() end
-    local w = fireWatch[1]
-    while w and now - w.t >= 0.04 do
-        table.remove(fireWatch, 1)
-        if w.note.Parent == nil then
-            fireVerified = true; fireMissN = 0; fireWatch = {}
-            return
-        end
-        fireMissN = fireMissN + 1
-        if fireMissN >= 4 then
-            fireWatch = {}
-            fireBreak("the game didn't react to the presses")
-            fireHandleBreak()
-            return
-        end
-        w = fireWatch[1]
+-- works out which routes are worth trying, best first, and prints what it
+-- found to the console (that's the part to send over if something's off)
+function FS.setup()
+    local L = FS.scan()
+    FS.listeners = L
+    FS.handlers = FS.findHandlers(L)
+    local verified, maybe, say = {}, {}, {}
+    say[#say + 1] = ("listeners seen: %d on InputBegan, %d on InputEnded"):format(#L.down, #L.up)
+    local function judge(name, r)
+        say[#say + 1] = name..": "..(r == true and "reaches the game" or (r == false and "does NOT reach the game" or "can't tell (no probe)"))
+        if r == true then verified[#verified + 1] = name elseif r == nil then maybe[#maybe + 1] = name end
     end
+    if #L.down > 0 and #L.up > 0 then
+        judge("all", FS.reaches("all"))
+    else
+        say[#say + 1] = "all: getconnections gave no listeners"
+    end
+    local sOk, sWhy = FS.signalTest()
+    if sOk then judge("signal", FS.reaches("signal")) else say[#say + 1] = "signal: "..tostring(sWhy) end
+    if FS.handlers.down and FS.handlers.up then
+        say[#say + 1] = "handler: found KeyPress and KeyLift (via "..FS.handlers.how..")"
+        table.insert(maybe, 1, "handler")
+    else
+        say[#say + 1] = "handler: couldn't find the game's KeyPress / KeyLift"
+    end
+    local routes = {}
+    for _, r in ipairs(verified) do routes[#routes + 1] = r end
+    for _, r in ipairs(maybe) do routes[#routes + 1] = r end
+    say[#say + 1] = "routes to try: "..(#routes > 0 and table.concat(routes, ", ") or "none")
+    for _, line in ipairs(say) do warn("[bfnf:r] firesignal: "..line) end
+    return routes
+end
+
+function FS.key(down, lane)
+    local pair = FS.objs[lane]
+    if not pair or not FS.route then return false end
+    local ok, err = FS.call(FS.route, down, pair[down and 1 or 2])
+    if ok then FS.failN = 0; return true end
+    FS.failN = FS.failN + 1
+    if FS.failN >= 3 and not FS.skipWhy then
+        FS.skipWhy = ("route '%s' keeps erroring: %s"):format(FS.route, tostring(err))
+    end
+    return false
+end
+
+-- sends one key event and says how it went out ("fire" or "vim"), so the
+-- release can go the same way
+function FS.send(down, lane, via)
+    if via == nil then via = (FS.on and not FS.broken) and "fire" or "vim" end
+    if via == "fire" and FS.key(down, lane) then return "fire" end
+    VIM:SendKeyEvent(down, KEYS[lane], false, game)
+    return "vim"
 end
 
 -- ════════════════════════════════════════════════════════════
@@ -548,7 +654,7 @@ end
 local function vimDown(lane)
     if not lanePressed[lane] then
         lanePressed[lane]=true
-        laneVia[lane] = sendKey(true, lane)
+        FS.via[lane] = FS.send(true, lane)
         lightTile(lane, true)
     end
 end
@@ -556,8 +662,8 @@ end
 local function vimUp(lane)
     if lanePressed[lane] then
         lanePressed[lane]=false
-        sendKey(false, lane, laneVia[lane])
-        laneVia[lane] = nil
+        FS.send(false, lane, FS.via[lane])
+        FS.via[lane] = nil
         lightTile(lane, false)
     end
 end
@@ -606,6 +712,87 @@ local function stopHold(lane, interrupted)
     laneHoldFrame[lane]=nil
     vimUp(lane)
     if interrupted then resetLnHold(lane) end
+end
+
+-- ── firesignal checks (they need stopHold and vimUp, so they sit down here) ──
+
+-- moves to the next route. lets go of everything first, the way it went down
+function FS.advance(why)
+    for i=1,4 do
+        if laneHoldFrame[i] then stopHold(i, false) end
+        vimUp(i)
+    end
+    FS.routeI = FS.routeI + 1
+    FS.route = FS.routes[FS.routeI]
+    FS.failN, FS.missN, FS.watch = 0, 0, {}
+    if FS.route then
+        warn(("[bfnf:r] firesignal: %s, trying route '%s'"):format(why, FS.route))
+    else
+        FS.giveUp(why)
+    end
+end
+
+function FS.handleBreak()
+    local why = FS.breakWhy
+    FS.breakWhy = nil
+    warn("[bfnf:r] firesignal presses off: "..tostring(why))
+    FS.apply(false)
+    pcall(function() FS.toggle:SetValue(false) end)
+    window:Notification({Title="firesignal", Text="didn't work here ("..tostring(why).."), back to the old way", Duration=5})
+end
+
+-- a hit note is destroyed on the spot, so a press that really landed makes the
+-- note vanish. until a route has proven itself, presses are watched for a
+-- moment. it checks again after a long gap (a new song)
+function FS.watchAdd(note, now, lane)
+    if not FS.on or FS.broken then return end
+    if now - FS.lastPress > 10 then
+        -- a long gap means a new song: check the route again, and refresh the
+        -- listeners in case the game reconnected its own
+        FS.verified = false; FS.missN = 0
+        local L = FS.scan()
+        if #L.down > 0 then
+            FS.listeners = L
+            local h = FS.findHandlers(L)
+            if h.down and h.up then FS.handlers = h end
+        end
+    end
+    FS.lastPress = now
+    -- a press that fell back to vim (the route errored) says nothing about the route
+    if FS.via[lane] ~= "fire" then return end
+    if FS.verified or #FS.watch >= 12 then return end
+    FS.watch[#FS.watch + 1] = {note = note, t = now}
+end
+
+function FS.watchStep(now)
+    if FS.breakWhy then FS.handleBreak(); return end
+    if FS.skipWhy then
+        local why = FS.skipWhy; FS.skipWhy = nil
+        FS.advance(why)
+        if FS.breakWhy then FS.handleBreak() end
+        return
+    end
+    local i = 1
+    while i <= #FS.watch do
+        local w = FS.watch[i]
+        if w.note.Parent == nil then
+            FS.verified = true; FS.missN = 0; FS.watch = {}
+            if not FS.reported then
+                FS.reported = true
+                warn(("[bfnf:r] firesignal: route '%s' is hitting notes"):format(tostring(FS.route)))
+            end
+            return
+        elseif now - w.t >= 0.09 then
+            table.remove(FS.watch, i)
+            FS.missN = FS.missN + 1
+        else
+            i = i + 1
+        end
+    end
+    if FS.missN >= 2 then
+        FS.advance(("route '%s' didn't hit any notes"):format(tostring(FS.route)))
+        if FS.breakWhy then FS.handleBreak() end
+    end
 end
 
 -- ════════════════════════════════════════════════════════════
@@ -1070,7 +1257,7 @@ local function pfCalibrate(mf)
         if pfBadN >= 3 then pfLocked = false; pfBadN = 0; pfGoodN = 0 end
     else
         -- a + reading means the press was early, so lead less
-        pfLead = math.clamp(pfLead - med/1000 * 0.6, fireOn and -0.02 or 0, 0.25)
+        pfLead = math.clamp(pfLead - med/1000 * 0.6, FS.on and -0.02 or 0, 0.25)
         pfGoodN = (math.abs(med) <= 3) and (pfGoodN + 1) or 0
         if pfGoodN >= 2 then pfLocked = true; pfGoodN = 0; pfBadN = 0 end
     end
@@ -1142,7 +1329,7 @@ local function perfectStep(dt)
     local fallbackV = math.max(1, 5.5 * (tonumber(S.NoteSpeed) or 2))
 
     pfCalibrate(KS.Parent)
-    fireWatchStep(now)
+    FS.watchStep(now)
 
     -- press on the frame that lands closest to the hit: the first frame where
     -- the note is within our lead plus half a frame of the line
@@ -1177,7 +1364,7 @@ local function perfectStep(dt)
                 else
                     vimTap(lane)
                 end
-                fireWatchAdd(note, now)
+                if rem > -0.03 then FS.watchAdd(note, now, lane) end
             end
         end
     end
@@ -1235,8 +1422,8 @@ local function hPress(lane, note, nf, e, gapNext, density, now, rem, fallbackV)
     else
         vimTap(lane, (humanize and hHumanTaps) and humanTapDur(gapNext, density) or nil)
     end
-    -- only presses meant to land inside a hit window get checked
-    if math.abs(e) <= 50 then fireWatchAdd(note, now) end
+    -- only presses meant to land cleanly inside a hit window get checked
+    if math.abs(e) <= 20 and rem > -0.03 then FS.watchAdd(note, now, lane) end
 end
 
 -- decides the notes that landed in the same instant together, as a chord
@@ -1341,11 +1528,11 @@ local function humanStep(dt)
     local now = tick()
     local S = _G.Settings or {}
     local fallbackV = math.max(1, 5.5 * (tonumber(S.NoteSpeed) or 2))
-    fireWatchStep(now)
+    FS.watchStep(now)
     -- time between our press and the frame the game reads the note on. the
     -- latency slider (or auto latency) sets this, same meaning as always:
     -- bigger slider = press later
-    local lead = math.clamp((130.5 - vimLatencyMs) / 1000, fireOn and -0.03 or 0, 0.25)
+    local lead = math.clamp((130.5 - vimLatencyMs) / 1000, FS.on and -0.03 or 0, 0.25)
     local dtHalf = pfDt / 2
 
     -- every lane: the notes that are close, nearest first
@@ -1432,17 +1619,17 @@ end
 -- weights with humanize off) decides and presses
 -- ════════════════════════════════════════════════════════════
 -- switches the press method. lets go of everything first (the way it went
--- down) so nothing stays stuck, then moves the timing a frame over: firesignal
--- skips the frame the input queue costs. the calibration does the fine part
-applyPressMethod = function(on)
+-- down) so nothing stays stuck, then moves the timing a frame over: fire skips
+-- the frame the input queue costs. the calibration does the fine part
+FS.apply = function(on)
     on = on and true or false
-    if on == fireOn then return end
+    if on == FS.on then return end
     for i=1,4 do
         if laneHoldFrame[i] then stopHold(i, false) end
         vimUp(i)
     end
-    fireOn = on
-    fireWatch = {}; fireMissN = 0
+    FS.on = on
+    FS.watch = {}; FS.missN = 0
     local fr = pfDt
     if on then
         pfLead = math.max(-0.02, pfLead - fr)
@@ -1463,7 +1650,7 @@ startLoop = function()
         if laneHoldFrame[i] then stopHold(i,false) end
         vimUp(i)
     end
-    refreshKeys()   -- picks up the keybinds from the game settings
+    FS.refreshKeys()   -- picks up the keybinds from the game settings
     if perfected then
         -- perfect mode takes over completely. the old auto latency is shut
         -- off and none of the humanize stuff is touched
@@ -1497,7 +1684,7 @@ iL:AddSeparator("ILS2",{})
 iL:AddLabel("IL3",{Text="<b>right shift</b> = open / close the menu"})
 
 iR:AddLabel("IR1",{Text="<font color='#C41E3A'><b>botplay tab</b></font>"})
-iR:AddLabel("IR2",{Text="enable → turns botplay on or off\nperfect mode → a true 100%, presses every note on the exact frame it lands. overrides everything else while it's on\nfiresignal presses (beta) → presses by calling the game's own key handler instead of sending a key event. no input lag, steadier timing. it tests itself and goes back to the old way if it doesn't work\ntile lights → lights up the on-screen keys for looks\nmiss jacks → skips super-fast repeat notes so it doesn't stumble\nauto latency → watches your timing and adjusts itself, no setup needed\nvim latency → a manual timing offset, only used when auto latency is off\nhit chances → weights, not percentages, only used while humanize is off"})
+iR:AddLabel("IR2",{Text="enable → turns botplay on or off\nperfect mode → a true 100%, presses every note on the exact frame it lands. overrides everything else while it's on\nfiresignal presses (beta) → hands fake key presses straight to the game's key handler instead of sending a key event, so no input lag. it tests how to reach the game on your executor and goes back to the old way if nothing works\ntile lights → lights up the on-screen keys for looks\nmiss jacks → skips super-fast repeat notes so it doesn't stumble\nauto latency → watches your timing and adjusts itself, no setup needed\nvim latency → a manual timing offset, only used when auto latency is off\nhit chances → weights, not percentages, only used while humanize is off"})
 iR:AddSeparator("IRS1",{})
 iR:AddLabel("IR3",{Text="<font color='#D0D0D6'><b>advanced bp tab</b></font>"})
 iR:AddLabel("IR3B",{Text="humanize → plays with realistic, human-like timing instead of frame-perfect inputs. every part of it is its own switch, so mix and match\nskill preset, accuracy, consistency, mistakes → how good, and how steady, this 'player' is\ndifficulty scanner → points out a song's hardest sections the moment it loads"})
@@ -1543,31 +1730,33 @@ pL:AddToggle("Perfected",{
     end,
 })
 
-fireToggle = pL:AddToggle("FireSignal",{
+FS.toggle = pL:AddToggle("FireSignal",{
     Text="firesignal presses (beta)", Value=false,
-    Tooltip="presses by calling the game's own key handler instead of sending a key event, so there's no input lag and the timing stays steadier. it tests itself and goes back to the old way on its own if it doesn't work here",
+    Tooltip="presses by handing fake key events straight to the game's key handler instead of sending a key event, so there's no input lag and the timing stays steadier. it tests how to reach the game on your executor, and goes back to the old way on its own if nothing works",
     Callback=function(val)
-        fireReq = fireReq + 1
-        local mine = fireReq
+        FS.req = FS.req + 1
+        local mine = FS.req
         if not val then
-            local was = fireOn
-            applyPressMethod(false)
+            local was = FS.on
+            FS.apply(false)
             if was then window:Notification({Title="firesignal",Text="off, back to the old way",Duration=2}) end
             return
         end
-        fireBroken = false; fireBreakWhy = nil; fireVerified = false; fireMissN = 0; fireFailN = 0
+        FS.broken = false; FS.breakWhy = nil; FS.skipWhy = nil; FS.verified = false
+        FS.reported = false; FS.missN = 0; FS.failN = 0
         task.spawn(function()
-            local ok, why = fireSelfTest()
-            if mine ~= fireReq then return end   -- flipped again while it was testing
-            if not ok then
-                fireBroken = true
-                pcall(function() fireToggle:SetValue(false) end)
-                window:Notification({Title="firesignal",Text="didn't work here ("..tostring(why).."), staying on the old way",Duration=5})
+            local routes = FS.setup()
+            if mine ~= FS.req then return end   -- flipped again while it was testing
+            if #routes == 0 then
+                FS.broken = true
+                pcall(function() FS.toggle:SetValue(false) end)
+                window:Notification({Title="firesignal",Text="can't reach the game's key handler on this executor, staying on the old way (details in the console)",Duration=6})
                 return
             end
-            refreshKeys()
-            applyPressMethod(true)
-            window:Notification({Title="firesignal",Text="<font color='#C41E3A'>on</font>, pressing straight through the game's key handler",Duration=3})
+            FS.routes, FS.routeI, FS.route = routes, 1, routes[1]
+            FS.refreshKeys()
+            FS.apply(true)
+            window:Notification({Title="firesignal",Text="<font color='#C41E3A'>on</font>, route: "..FS.route,Duration=3})
         end)
     end,
 })
