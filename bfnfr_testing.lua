@@ -57,7 +57,7 @@ local function guard(obj, label)
     end})
 end
 
-local VERSION = "v3.7-beta"  -- bump this every update or the footer lies to everyone
+local VERSION = "v3.8-beta"  -- bump this every update or the footer lies to everyone
 
 -- colors: galaxy collapse theme, crimson + ink black + white. very emo, i love it
 local C_RED   = Color3.fromRGB(196, 30,  58)
@@ -130,6 +130,10 @@ local RunService   = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local VIM          = game:GetService("VirtualInputManager")
 local UIS          = game:GetService("UserInputService")
+-- the executor has its own _G and the games real one lives in getrenv()._G. without this line every _G.Settings thing in here
+-- read an empty table and quietly did nothing (HitLate, keybinds...). the diagnostics caught it
+local _G = _G
+pcall(function() local r = getrenv and getrenv()._G; if type(r) == "table" then _G = r end end)
 local Players      = game:GetService("Players")
 local v5           = Players.LocalPlayer
 
@@ -428,7 +432,7 @@ local FS = {
     via = {},             -- how each lane's key went down, so it comes back up the same way (dont mix them up)
     routes = {}, routeI = 0, route = nil,
     handlers = {},
-    listeners = {down = {}, up = {}, at = 0},
+    listeners = {down = {}, up = {}, gameDown = {}, gameUp = {}, at = 0},
     picker = nil,
     apply = nil,          -- defined down in the main loop part (forward declare, yes again)
     defaultKeys = {Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.W, Enum.KeyCode.D},
@@ -483,20 +487,38 @@ end
 
 -- grabs every lua listener on InputBegan / InputEnded (needs getconnections)
 function FS.scan()
-    local out = {down = {}, up = {}, at = tick()}
+    local out = {down = {}, up = {}, gameDown = {}, gameUp = {}, at = tick()}
     if type(getconnections) ~= "function" then return out end
-    for _, pair in ipairs({{UIS.InputBegan, out.down}, {UIS.InputEnded, out.up}}) do
+    for _, pair in ipairs({{UIS.InputBegan, out.down, out.gameDown}, {UIS.InputEnded, out.up, out.gameUp}}) do
         local ok, conns = pcall(getconnections, pair[1])
         if ok and type(conns) == "table" then
             for _, c in ipairs(conns) do
                 local okf, f = pcall(function() return c.Function end)
                 local on = true
                 pcall(function() if c.Enabled == false then on = false end end)
-                if okf and type(f) == "function" and on then pair[2][#pair[2] + 1] = f end
+                if okf and type(f) == "function" and on then
+                    pair[2][#pair[2] + 1] = f
+                    -- scripts from the game have a path like Players.x.PlayerGui.Main... as their source, our ui library
+                    -- has a random string. only the first kind is worth calling in the "all" route (the library alone has 1000+)
+                    local src = FS.info(f, "s")
+                    if type(src) == "string" and src:find(".", 1, true) then pair[3][#pair[3] + 1] = f end
+                end
             end
         end
     end
     return out
+end
+
+-- the songPlay module moved once already (FNFMain > Modules now), so look for it instead of trusting a path
+function FS.findModule()
+    local ok, m = pcall(function() return v5.PlayerGui:FindFirstChild("songPlay", true) end)
+    if ok and m and m:IsA("ModuleScript") then return m end
+    if type(getloadedmodules) == "function" then
+        local ok2, mods = pcall(getloadedmodules)
+        if ok2 and type(mods) == "table" then
+            for _, x in ipairs(mods) do if x.Name == "songPlay" then return x end end
+        end
+    end
 end
 
 -- finds the game's KeyPress / KeyLift by name from the listeners (the game ships its function
@@ -504,24 +526,24 @@ end
 function FS.findHandlers(L)
     local found = {how = "listeners"}
     local function pick(list, name)
+        local loose
         for _, f in ipairs(list) do
             if FS.info(f, "n") == name then
                 local src = FS.info(f, "s")
-                if type(src) ~= "string" or src:find("songPlay", 1, true) then return f end
+                if type(src) == "string" and src:find("songPlay", 1, true) then return f end
+                loose = loose or f
             end
         end
+        return loose
     end
     found.down, found.up = pick(L.down, "KeyPress"), pick(L.up, "KeyLift")
     if not (found.down and found.up) and type(getsenv) == "function" then
         pcall(function()
-            for _, ch in ipairs(v5.PlayerGui.Main:GetChildren()) do
-                local sp = ch:IsA("LocalScript") and ch:FindFirstChild("songPlay")
-                if sp then
-                    local env = getsenv(sp)
-                    if type(env) == "table" and type(env.KeyPress) == "function" and type(env.KeyLift) == "function" then
-                        found.down, found.up, found.how = env.KeyPress, env.KeyLift, "getsenv"
-                    end
-                    break
+            local sp = FS.findModule()
+            if sp then
+                local env = getsenv(sp)
+                if type(env) == "table" and type(env.KeyPress) == "function" and type(env.KeyLift) == "function" then
+                    found.down, found.up, found.how = env.KeyPress, env.KeyLift, "getsenv"
                 end
             end
         end)
@@ -539,7 +561,10 @@ function FS.call(route, down, obj)
             local s = FS.scan()
             if #s.down > 0 then FS.listeners = s else FS.listeners.at = tick() end
         end
-        local list = down and FS.listeners.down or FS.listeners.up
+        local L = FS.listeners
+        local list
+        if down then list = (L.gameDown and #L.gameDown > 0) and L.gameDown or L.down
+        else list = (L.gameUp and #L.gameUp > 0) and L.gameUp or L.up end
         if #list == 0 then return false, "no listeners" end
         local any, lastErr = false, nil
         for _, f in ipairs(list) do
@@ -593,6 +618,7 @@ function FS.setup()
     FS.handlers = FS.findHandlers(L)
     local verified, maybe, say = {}, {}, {}
     say[#say + 1] = ("listeners seen: %d on InputBegan, %d on InputEnded"):format(#L.down, #L.up)
+    say[#say + 1] = ("of those from the game's own scripts: %d on InputBegan, %d on InputEnded"):format(#L.gameDown, #L.gameUp)
     local function judge(name, r)
         say[#say + 1] = name..": "..(r == true and "reaches the game" or (r == false and "does NOT reach the game" or "can't tell (no probe)"))
         if r == true then verified[#verified + 1] = name elseif r == nil then maybe[#maybe + 1] = name end
@@ -650,9 +676,12 @@ function FS.report()
     add(okE and ("executor: "..tostring(en).." "..tostring(ev)) or "executor: unknown (no identifyexecutor)")
     add("has: firesignal="..yn(firesignal).." getconnections="..yn(getconnections).." getsenv="..yn(getsenv)
         .." getgc="..yn(getgc).." hookfunction="..yn(hookfunction).." setclipboard="..yn(setclipboard)
-        .." debug.info="..yn(debug.info).." debug.getupvalues="..yn(debug.getupvalues).." getupvalues="..yn(getupvalues))
+        .." debug.info="..yn(debug.info).." debug.getupvalues="..yn(debug.getupvalues).." getupvalues="..yn(getupvalues)
+        .." getrenv="..yn(getrenv).." getloadedmodules="..yn(getloadedmodules))
 
     add("== game state ==")
+    local okR, rg = pcall(function() return getrenv()._G end)
+    add("getrenv()._G: "..((okR and type(rg) == "table" and (rg == _G and "in use (this script looks at the game's own _G)" or "exists but is not in use")) or "not available"))
     add("Device: "..tostring(_G.Index and _G.Index.Device))
     add("Settings.Inputs: "..show(_G.Settings and _G.Settings.Inputs))
     add("touch/keyboard/gamepad enabled: "..tostring(UIS.TouchEnabled).."/"..tostring(UIS.KeyboardEnabled).."/"..tostring(UIS.GamepadEnabled))
@@ -670,21 +699,26 @@ function FS.report()
                 add("getconnections failed: "..tostring(conns))
             else
                 add("count: "..#conns)
-                for i, c in ipairs(conns) do
-                    if i > 30 then add("... (more)"); break end
-                    local f, on, foreign, lua
+                local groups, order, nolua = {}, {}, 0
+                for _, c in ipairs(conns) do
+                    local f
                     pcall(function() f = c.Function end)
-                    pcall(function() on = c.Enabled end)
-                    pcall(function() foreign = c.ForeignState end)
-                    pcall(function() lua = c.LuaConnection end)
                     if type(f) == "function" then
                         local nm, src, ln = FS.info(f, "n"), FS.info(f, "s"), FS.info(f, "l")
-                        add(("%d: %s | %s | line %s | on=%s foreign=%s"):format(i, tostring(nm or "(no name)"), tostring(src or "?"), tostring(ln or "?"), tostring(on), tostring(foreign)))
+                        local key = tostring(nm).."|"..tostring(src).."|"..tostring(ln)
+                        if not groups[key] then groups[key] = {n = 0, nm = nm, src = src, ln = ln}; order[#order + 1] = key end
+                        groups[key].n = groups[key].n + 1
                         if nm == "KeyPress" then kp = kp or f end
                         if nm == "KeyLift" then kl = kl or f end
                     else
-                        add(("%d: no lua function (Function is %s) on=%s foreign=%s lua=%s"):format(i, type(f), tostring(on), tostring(foreign), tostring(lua)))
+                        nolua = nolua + 1
                     end
+                end
+                add("connections with no lua function (core scripts / another vm): "..nolua)
+                for i, key in ipairs(order) do
+                    if i > 40 then add("... (more groups)"); break end
+                    local g = groups[key]
+                    add(("x%d  name=%s | source=%s | line %s"):format(g.n, (g.nm == nil or g.nm == "") and "(anonymous)" or tostring(g.nm), tostring(g.src or "?"), tostring(g.ln or "?")))
                 end
             end
         end
@@ -693,18 +727,14 @@ function FS.report()
     add("== songPlay module ==")
     local env
     pcall(function()
-        for _, ch in ipairs(v5.PlayerGui.Main:GetChildren()) do
-            local sp = ch:IsA("LocalScript") and ch:FindFirstChild("songPlay")
-            if sp then
-                add("found: "..sp:GetFullName())
-                if type(getsenv) ~= "function" then
-                    add("no getsenv")
-                else
-                    local ok, e = pcall(getsenv, sp)
-                    if ok and type(e) == "table" then env = e else add("getsenv failed: "..tostring(e)) end
-                end
-                break
-            end
+        local sp = FS.findModule()
+        if not sp then add("no module called songPlay found under PlayerGui"); return end
+        add("found: "..sp:GetFullName())
+        if type(getsenv) ~= "function" then
+            add("no getsenv")
+        else
+            local ok, e = pcall(getsenv, sp)
+            if ok and type(e) == "table" then env = e else add("getsenv failed: "..tostring(e)) end
         end
     end)
     if env then
@@ -714,6 +744,32 @@ function FS.report()
         add("functions in its env: "..table.concat(names, ", "))
         if type(env.KeyPress) == "function" then kp = kp or env.KeyPress end
         if type(env.KeyLift) == "function" then kl = kl or env.KeyLift end
+    end
+
+    -- last resort, diagnostics only: if neither the listeners nor the module env gave up KeyPress, dig through the gc for it.
+    -- chunked with a time limit so a big heap cant freeze the phone
+    if not kp and type(getgc) == "function" then
+        add("KeyPress not found yet, searching the gc (can take a few seconds)")
+        local t0 = tick()
+        local okG, all = pcall(getgc)
+        if okG and type(all) == "table" then
+            add("gc size: "..#all)
+            for i, f in ipairs(all) do
+                if type(f) == "function" then
+                    local nm = FS.info(f, "n")
+                    if nm == "KeyPress" or nm == "KeyLift" then
+                        add(("gc: %s | source=%s | line %s"):format(nm, tostring(FS.info(f, "s")), tostring(FS.info(f, "l"))))
+                        if nm == "KeyPress" then kp = kp or f else kl = kl or f end
+                    end
+                end
+                if i % 3000 == 0 then
+                    task.wait()
+                    if tick() - t0 > 8 then add("gc search stopped early (8s limit)"); break end
+                end
+            end
+        else
+            add("getgc failed: "..tostring(all))
+        end
     end
 
     add("== the game's KeyPress ==")
