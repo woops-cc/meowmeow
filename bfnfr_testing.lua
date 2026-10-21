@@ -57,7 +57,7 @@ local function guard(obj, label)
     end})
 end
 
-local VERSION = "v3.8-beta"  -- bump this every update or the footer lies to everyone
+local VERSION = "v3.9-beta"  -- bump this every update or the footer lies to everyone
 
 -- colors: galaxy collapse theme, crimson + ink black + white. very emo, i love it
 local C_RED   = Color3.fromRGB(196, 30,  58)
@@ -134,6 +134,22 @@ local UIS          = game:GetService("UserInputService")
 -- read an empty table and quietly did nothing (HitLate, keybinds...). the diagnostics caught it
 local _G = _G
 pcall(function() local r = getrenv and getrenv()._G; if type(r) == "table" then _G = r end end)
+-- HitLate used to be a plain boolean in the game settings. now its a table with a Value inside (the game reads HitLate.Value everywhere)
+-- so writing a bare true over it made Combo explode (attempt to index boolean with Value). HL reads and writes whichever shape it finds
+local HL = {}
+function HL.get()
+    local s = _G.Settings
+    local h = s and s.HitLate
+    if type(h) == "boolean" then return h end
+    if h ~= nil then local ok, v = pcall(function() return h.Value end); return ok and v == true end
+    return false
+end
+function HL.set(v)
+    local s = _G.Settings
+    if not s then return end
+    local h = s.HitLate
+    if h == nil or type(h) == "boolean" then s.HitLate = v else pcall(function() h.Value = v end) end
+end
 local Players      = game:GetService("Players")
 local v5           = Players.LocalPlayer
 
@@ -203,10 +219,10 @@ local function startAutoLatency()
         autoLatencyConn:Disconnect(); autoLatencyConn = nil
     else
         -- first start: remember the real HitLate so stop can put it back. leaving someones setting flipped is rude
-        alSavedHitLate = _G.Settings and _G.Settings.HitLate or false
+        alSavedHitLate = HL.get()
     end
     alReset("hunt")
-    if _G.Settings then _G.Settings.HitLate = true end
+    HL.set(true)
 
     if alSongWatcher then alSongWatcher:Disconnect() end
     task.spawn(function()
@@ -300,7 +316,7 @@ local function stopAutoLatency()
     if autoLatencyConn then autoLatencyConn:Disconnect(); autoLatencyConn=nil end
     if alSongWatcher   then alSongWatcher:Disconnect();   alSongWatcher=nil   end
     -- only put HitLate back if WE turned it on (dont touch what isnt yours)
-    if wasRunning and _G.Settings then _G.Settings.HitLate = alSavedHitLate end
+    if wasRunning then HL.set(alSavedHitLate) end
     alReset("hunt")
 end
 
@@ -845,6 +861,8 @@ function FS.report()
     add("'signal' route reaches the game's device listener: "..r2s(FS.reaches("signal")))
     add("handler found: "..tostring(FS.handlers.down ~= nil and FS.handlers.up ~= nil).." (via "..tostring(FS.handlers.how)..")")
     add(("state: on=%s broken=%s route=%s verified=%s routes=%s"):format(tostring(FS.on), tostring(FS.broken), tostring(FS.route), tostring(FS.verified), table.concat(FS.routes, ",")))
+    add("scanner hook: installed="..tostring(FS.hookInstalled == true).." song starts it has seen="..tostring(FS.hookCalls or 0))
+    add("HitLate in the game settings is a "..type(_G.Settings and _G.Settings.HitLate).." (HL says "..tostring(HL.get())..")")
 
     local text = table.concat(out, "\n")
     for _, line in ipairs(out) do warn("[bfnf:diag] "..line) end
@@ -1363,18 +1381,21 @@ local function installChartScanHook()
     pcall(function()
         local mainGui = v5.PlayerGui:WaitForChild("Main", 15)
         if not mainGui then return end
-        local hostScript
-        for _, ch in ipairs(mainGui:GetChildren()) do
-            if ch:IsA("LocalScript") and ch:FindFirstChild("songPlay") then
-                hostScript = ch; break
-            end
+        -- the game moved songPlay to FNFMain > Modules and this used to look for it in the old spot, so the scanner never
+        -- attached (rip difficulty scanner). FS.findModule() hunts for it now, and keeps trying for 15s in case it loads late
+        local mod
+        for _ = 1, 30 do
+            mod = FS.findModule()
+            if mod then break end
+            task.wait(0.5)
         end
-        if not hostScript then return end
-        local sP = require(hostScript.songPlay)
+        if not mod then return end
+        local sP = require(mod)
         for _, fnName in ipairs({"PlaySong"}) do
             if type(sP[fnName]) == "function" then
                 local original = sP[fnName]
                 sP[fnName] = function(songModule, ...)
+                    FS.hookCalls = (FS.hookCalls or 0) + 1
                     hResetRun()
 
                     -- the 2nd arg after songModule is the side the game plays (1 or 2)
@@ -1390,6 +1411,7 @@ local function installChartScanHook()
             end
         end
         scanHookInstalled = true
+        FS.hookInstalled = true
     end)
 end
 
@@ -1420,8 +1442,8 @@ local function startPerfectMode()
     if not pfActive then
         pfActive = true
         -- msIndic only shows with HitLate on. remember the real value so it can go back when perfect mode stops
-        pfSavedHitLate = _G.Settings and _G.Settings.HitLate or false
-        if _G.Settings then _G.Settings.HitLate = true end
+        pfSavedHitLate = HL.get()
+        HL.set(true)
     end
     pfBuf = {}; pfLastText = nil
 end
@@ -1429,7 +1451,7 @@ end
 local function stopPerfectMode()
     if not pfActive then return end
     pfActive = false
-    if _G.Settings then _G.Settings.HitLate = pfSavedHitLate end
+    HL.set(pfSavedHitLate)
 end
 
 local function pfMedian(list)
