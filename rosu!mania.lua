@@ -189,6 +189,7 @@ local personalBiasMs  = 0
 local songStartTick   = 0
 
 local hAutoScan      = true
+local hFlawless      = false   -- the flawless skill preset: still humanized, but every hit gets kept inside perfectx
 local hReactToSpikes = true
 local lastScanResult = nil     -- {totalSeconds=, noteCount=, spikes={ {t=,strain=}, ... }}
 local chartIsInSpikeWindow
@@ -643,6 +644,30 @@ local function pickRating()
     return pool[math.random(1, #pool)]
 end
 
+-- flawless preset: the humanize engine runs like normal (noise, drift, tilt, chords, taps, holds,
+-- all of it) and THEN every error gets squeezed into a safe slice of the perfectx window. a frame
+-- can land half a frame off the target, so the slice shrinks when the fps does. slips and drops
+-- turn into an edge-of-the-window hit instead of a miss, so it stays human but never leaves 100%
+local function flawlessBand()
+    return math.clamp(JUDGE.px - (G.step / G.rate) / 2 - 5, 2, 12)
+end
+
+local function flawlessLimit(e)
+    local band = flawlessBand()
+    local x = math.clamp(e / band, -20, 20)
+    local ex = math.exp(2 * x)
+    return band * (ex - 1) / (ex + 1)   -- tanh by hand, squashes big errors instead of piling them on the edge
+end
+
+-- how far past the target a frame is allowed to press. half a frame normally, more when the
+-- frames come uneven so one long frame cant throw the hit out of the window. tgt in chart ms
+local function flawlessSlack(tgt)
+    local pxC = JUDGE.px * G.rate
+    local lo = math.max(G.step / 2, G.stepHi - pxC + 4 - tgt)
+    local hi = pxC - 4 - tgt
+    return math.max(1, math.min(lo, hi))
+end
+
 -- ---- humanize engine ----
 -- the player decides an error for every note BEFORE it lands (ms, + = late, - = early) and the
 -- hands (further down) press at exactly that moment. every layer is its own switch on the advanced tab
@@ -817,9 +842,10 @@ local function hDecide(c)
     if hTiltOn and (missed or slipped or math.abs(e) > 40) then
         hTilt = math.min(2, hTilt + (missed and 0.8 or 0.5))
     end
-    if missed then return nil, sigma end
+    if missed and not hFlawless then return nil, sigma end
 
     if not hEarlyHits then e = math.abs(e) end
+    if hFlawless then return flawlessLimit(e), sigma end
     return math.clamp(e, -110, 125), sigma
 end
 
@@ -844,7 +870,8 @@ local function hHoldPlan(note, now)
     local plan = {note = note, t0 = now, relOff = 0}
     if humanize and not perfected and hHumanHolds then
         plan.relOff = math.clamp(35 + gaussianRandom() * 30, 0, 120)
-        if hAllowRealMiss and hSlips then
+        if hFlawless then plan.relOff = math.clamp(4 + gaussianRandom() * 7, -6, 18) end   -- stays well inside the release window
+        if hAllowRealMiss and hSlips and not hFlawless then
             local p = (hMistakes / 100) * 0.02 * (1 + (100 - hAccuracy) / 40)
             if hTiltOn then p = p * (1 + 1.5 * hTilt) end
             if math.random() < math.min(0.25, p) then
@@ -958,7 +985,11 @@ local function hPlanGroup(group, all, now)
         end
     end
 
-    if missJacks then
+    if hFlawless then
+        for k = 1, size do es[k] = flawlessLimit(es[k] or (gaussianRandom() * 4)) end
+    end
+
+    if missJacks and not hFlawless then
         for k, it in ipairs(group) do
             -- stumbles on a fast same-key repeat, on purpose (humans trip on jacks, so do we)
             if es[k] and (now + it.rem) - hLaneHit[it.lane] < 0.12 then es[k] = false end
@@ -1009,7 +1040,8 @@ local function humanHands(lanes, all, now)
             else
                 local p = hPlan[it.note]
                 if not p then break end
-                if it.early <= -p.e * G.rate + lt + dtHalf then
+                local tgt = -p.e * G.rate
+                if it.early <= tgt + lt + (hFlawless and flawlessSlack(tgt) or dtHalf) then
                     pfDone[it.note] = true
                     local nxt = nil
                     for m = k + 1, #list do
@@ -1278,7 +1310,7 @@ iR:AddLabel("IR1",{Text="<font color='#C41E3A'><b>botplay tab</b></font>"})
 iR:AddLabel("IR2",{Text="enable → turns botplay on or off\nperfect mode → a true 100%, presses every note on the frame closest to the hit. overrides everything else while it's on\npress method → VirtualInputManager is the normal way. firesignal hands the press straight to the game's own track function instead, so there's no input lag. if a method isn't landing hits it switches to the other one on its own\ndiagnostics → a report on your executor and the game, copied to your clipboard\ntile lights → lights up the on-screen tiles when the bot presses, just for looks\nmiss jacks → skips super-fast repeat notes so it doesn't stumble\nauto latency → reads the game's own hit log and adjusts itself, no setup needed\nvim latency → a manual timing offset, only used when auto latency is off\nhit chances → weights, not percentages, only used while humanize is off"})
 iR:AddSeparator("IRS1",{})
 iR:AddLabel("IR3",{Text="<font color='#D0D0D6'><b>advanced bp tab</b></font>"})
-iR:AddLabel("IR3B",{Text="humanize → plays with realistic, human-like timing instead of frame-perfect inputs. every part of it is its own switch, so mix and match\nskill preset, accuracy, consistency, mistakes → how good, and how steady, this 'player' is\ndifficulty scanner → points out a song's hardest sections the moment it loads"})
+iR:AddLabel("IR3B",{Text="humanize → plays with realistic, human-like timing instead of frame-perfect inputs. every part of it is its own switch, so mix and match\nskill preset, accuracy, consistency, mistakes → how good, and how steady, this 'player' is\nflawless preset → still humanized, but every hit stays perfectx so it's always 100%\ndifficulty scanner → points out a song's hardest sections the moment it loads"})
 iR:AddSeparator("IRS2",{})
 iR:AddLabel("IR5",{Text="<font color='#C41E3A'><b>works with</b></font>\n• any scroll speed and song rate\n• up & down scroll\n• hold notes\n• smooth at high fps, and still keeps up if your fps drops"})
 
@@ -1407,21 +1439,28 @@ aL:AddToggle("Humanize",{
     end,
 })
 
-local presetNames = {"custom","casual","average","skilled","pro","elite"}
+local presetNames = {"custom","casual","average","skilled","pro","elite","flawless"}
 local presets = {
     casual  = {acc=55, cons=40, mist=70},
     average = {acc=72, cons=55, mist=50},
     skilled = {acc=86, cons=65, mist=35},
     pro     = {acc=94, cons=78, mist=22},
     elite   = {acc=98, cons=88, mist=10},
+    flawless = {acc=100, cons=100, mist=0},
 }
 local accSlider, consSlider, mistSlider
 
 aL:AddDropdown("SkillPreset",{
     Text="skill preset", Values=presetNames, Value=1,
-    Tooltip="one tap setups for accuracy, consistency and mistakes. 'custom' leaves the sliders alone",
+    Tooltip="one tap setups for accuracy, consistency and mistakes. 'custom' leaves the sliders alone. 'flawless' keeps everything humanized but never lets a hit leave perfectx, so it's always a 100% run. on firesignal that holds on any chart, on VirtualInputManager the game can still eat super close same-key notes",
     Callback=function(val)
-        local p = presets[(type(val)=="number") and presetNames[val] or val]
+        local name = (type(val)=="number") and presetNames[val] or val
+        local wasFlawless = hFlawless
+        hFlawless = (name == "flawless")
+        if hFlawless ~= wasFlawless then
+            window:Notification({Title="skill preset",Text=hFlawless and "<font color='#C41E3A'>flawless</font>, still humanized but every hit stays perfectx" or "flawless off",Duration=3})
+        end
+        local p = presets[name]
         if not p then return end
         hAccuracy, hConsistency, hMistakes = p.acc, p.cons, p.mist
         for _, pair in ipairs({{accSlider,p.acc},{consSlider,p.cons},{mistSlider,p.mist}}) do
