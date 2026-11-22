@@ -341,6 +341,7 @@ local function installHold()
         IBP.tbl = (G.ups(IBP.orig))
         IBP.tbl = IBP.tbl and IBP.tbl[1]
     end
+    warn("[hrp] hold support: " .. (IBP.wrapper and "input wrapper" or (IBP.tbl and "pressed-state table" or "NOT AVAILABLE")))
 end
 
 local function setHeld(lane, on)
@@ -717,7 +718,8 @@ local function holdTick(lane, tnow)
     local n = hp.note
     local want = hp.endT + hp.relOff * G.rate
     local drop = hp.dropFrac and (G.clockNow - hp.hitAt) >= hp.dropFrac * (hp.endT - hp.hitAt)
-    if drop or G.clockNow + G.step / 2 >= want or tnow - hp.t0 > 60 or n.Destroyed then stopHold(lane) end
+    -- note: GoodHit destroys the head the moment it is hit, so n.Destroyed says nothing about the hold
+    if drop or G.clockNow + G.step / 2 >= want or tnow - hp.t0 > 60 then stopHold(lane) end
 end
 
 -- one note, one press: the game's own GoodHit, the same call its keyboard handler ends in
@@ -1226,6 +1228,5 @@ aR:AddToggle("HumanHolds",{
     Tooltip="holds are let go a little after the end, never on the exact frame, and now and then too soon (needs real misses on)",
     Callback=function(val) hHumanHolds=val end,
 })
-
 
 
