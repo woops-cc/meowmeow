@@ -1,4 +1,5 @@
 -- pathfinder is soon guys sTOP SPAMMING MY DMS !!!!!
+-- do note that this is still IN TESTING PHASE. WILL COME WITH BUGS SO IF U FIND ANY PLEASE DM ME CONSOLE + DEBUG
 -- ui library loading. loader first, and if github breaks it again (wrong urls, classic) it
 -- grabs the lib file directly and sets it up by hand. the loader and i have trust issues
 local LOADER_URL    = "https://raw.githubusercontent.com/Null-Cherry/Fire-Library/refs/heads/main/Loader.lua"
