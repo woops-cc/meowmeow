@@ -1,3 +1,4 @@
+-- pathfinder is soon guys sTOP SPAMMING MY DMS !!!!!
 -- ui library loading. loader first, and if github breaks it again (wrong urls, classic) it
 -- grabs the lib file directly and sets it up by hand. the loader and i have trust issues
 local LOADER_URL    = "https://raw.githubusercontent.com/Null-Cherry/Fire-Library/refs/heads/main/Loader.lua"
@@ -134,29 +135,30 @@ local RepS        = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
 
 local TOKEN     = "gdmacro"     -- our own input source name, the game treats it like one more finger
-local LOOKAHEAD = 0.30          -- seconds of macro that get queued ahead of the sim (events wait in the game's own queue, so they land on the exact tick)
+local LOOKAHEAD = 0.30          -- seconds of macro that get queued ahead of the sim (they wait in the game's own queue, so they land on the exact tick)
+local TICK      = 1 / 240       -- the physics runs at 240 ticks a second
 local MACRO_DIR = "gdmacros"
 
-local recording   = false
-local playing     = false
+local recording    = false
+local playing      = false
 local practiceOnly = true       -- bot runs only play inside practice mode, so they dont count as real completions
-local macro       = nil         -- {level=, events={{t=,a=,d=}}, traj={{t=,x=,y=}}, length=}
-local rec         = {events = {}, traj = {}}
-local nextIdx     = 1
-local anchor      = {valid = false, sim = 0, clock = 0}
-local lastSim, lastDead, lastLevel = nil, false, nil
-local driftMax, driftWarned = 0, false
-local hooked      = false
+local autoPractice = true       -- recording switches the level to practice mode by itself
+local nudgeTicks   = 0          -- manual timing shift for playback, in physics ticks
+local macro        = nil        -- {level=, events={{t=,a=,d=}}, traj={{t=,x=,y=}}, length=}
+local rec          = {events = {}, traj = {}}
+local nextIdx      = 1
+local lastSim, lastLevel = nil, nil
+local driftMax, driftWarned, practiceWarned = 0, false, false
+local lastPracticeTry = 0
+local hooked       = false
 local origQI, origQR
 local CR, RS
 local looping, lastErr = false, 0
 
-local function f2(x) return type(x) == "number" and string.format("%.2f", x) or tostring(x) end
-
 -- ---- the game ----
 -- the game is a full lua port of geometry dash (ReplicatedStorage.GDPort). ClientRuntime.snapshot() gives the live
 -- player state and every tap goes through RuntimeSupport.queueInput(timeline, time, token, action, down) into a
--- timeline the physics eats at 240 ticks a second, so an event with a future timestamp lands on the exact tick
+-- timeline the physics eats at 240 ticks a second: a tap with a timestamp lands on the exact tick that timestamp falls in
 local function loadModules()
     if CR and RS then return true end
     local gd = RepS:FindFirstChild("GDPort")
@@ -178,21 +180,47 @@ local function getTimeline()
     end
 end
 
--- recording: every real tap goes through queueInput / queueRelease, so a wrapper just writes down what passes
--- (time is converted from the timeline clock to simulation time with the anchor taken this frame). only reads
+-- one reading of "where the sim is" and "what the timeline clock says", taken at the same instant. every conversion
+-- between a tap timestamp and sim time uses a pair like this, read when it is needed (never a stale one from an earlier frame)
+local function nowPair()
+    if not CR then return nil end
+    local ok, snap = pcall(CR.snapshot)
+    local tl = getTimeline()
+    if ok and type(snap) == "table" and type(snap.time) == "number" and tl then return snap.time, tl.clock, snap, tl end
+end
+
+-- adds one recorded input, skipping an exact duplicate (queueRelease may call queueInput inside the game)
+local function pushEvent(t, a, d)
+    local last = rec.events[#rec.events]
+    if last and last.a == a and last.d == d and math.abs(last.t - t) < 0.000001 then return end
+    rec.events[#rec.events + 1] = {t = t, a = a, d = d}
+end
+
+local function heldAt(events, upto)
+    local held = false
+    for i = 1, upto do
+        local e = events[i]
+        if e.a == "release" then held = false elseif e.a == "jump" then held = e.d end
+    end
+    return held
+end
+
+-- recording: every real tap goes through queueInput / queueRelease, so a wrapper just writes down what passes. only reads
 local function installHooks()
     if hooked then return end
     hooked = true
     origQI, origQR = RS.queueInput, RS.queueRelease
     RS.queueInput = function(tl, time, token, action, down)
-        if recording and anchor.valid and token ~= TOKEN and type(time) == "number" then
-            rec.events[#rec.events + 1] = {t = anchor.sim + (time - anchor.clock), a = action, d = down == true}
+        if recording and token ~= TOKEN and type(time) == "number" then
+            local sT, cT = nowPair()
+            if sT then pushEvent(sT + (time - cT), action, down == true) end
         end
         return origQI(tl, time, token, action, down)
     end
     RS.queueRelease = function(tl, time, token)
-        if recording and anchor.valid and token ~= TOKEN and type(time) == "number" then
-            rec.events[#rec.events + 1] = {t = anchor.sim + (time - anchor.clock), a = "release", d = false}
+        if recording and token ~= TOKEN and type(time) == "number" then
+            local sT, cT = nowPair()
+            if sT then pushEvent(sT + (time - cT), "release", false) end
         end
         return origQR(tl, time, token)
     end
@@ -205,7 +233,7 @@ local function removeHooks()
     if RS.queueRelease ~= origQR then RS.queueRelease = origQR end
 end
 
--- takes our not-yet-played events out of the game's queue (new attempt, macro turned off, ...)
+-- takes our not-yet-played events out of the game's queue (rollback, macro turned off, ...)
 local function clearOurEvents(tl)
     if not tl then return end
     local q = tl.queue
@@ -215,8 +243,6 @@ local function clearOurEvents(tl)
     pcall(RS.releaseInput, tl.input, TOKEN)
     pcall(RS.releaseInput, tl.capture, TOKEN)
 end
-
-local function levelKey(snap) return tostring(snap.id) end
 
 local function saveMacro()
     if not macro then return false, "no macro" end
@@ -239,47 +265,78 @@ local function summary(m)
     return string.format("level %s: %d inputs over %.1fs", tostring(m.level), #m.events, m.length or 0)
 end
 
-local function newAttempt(tl)
-    nextIdx = 1
-    driftMax, driftWarned = 0, false
-    rec = {events = {}, traj = {}}
+-- the sim time went backwards: you died and respawned at a checkpoint (or restarted). recording keeps everything
+-- BEFORE that moment and throws away the failed attempt after it, so the macro ends up as one clean run
+local function rollbackRecording(snap)
+    local Tc = snap.time
+    local ev = rec.events
+    local keep = {}
+    for _, e in ipairs(ev) do
+        if e.t < Tc - 0.0005 then keep[#keep + 1] = e end
+    end
+    rec.events = keep
+    local traj = {}
+    for _, p in ipairs(rec.traj) do
+        if p.t < Tc - 0.0005 then traj[#traj + 1] = p end
+    end
+    rec.traj = traj
+    -- the respawn keeps whatever your finger is doing: if the events say "held" but you are not holding (or the other way round), fix it at the checkpoint
+    local actual = type(snap.inputTiming) == "table" and snap.inputTiming.held == true
+    if heldAt(rec.events, #rec.events) ~= actual then
+        rec.events[#rec.events + 1] = {t = Tc, a = "jump", d = actual}
+    end
+end
+
+-- playback after a rollback: pick the macro up again from the checkpoint, with the right finger state
+local function resyncPlayback(snap, tl)
     clearOurEvents(tl)
+    local ev = macro.events
+    local i = 1
+    while i <= #ev and ev[i].t < snap.time - 0.0005 do i = i + 1 end
+    nextIdx = i
+    if heldAt(ev, i - 1) then
+        local sT, cT = snap.time, tl.clock
+        pcall(origQI or RS.queueInput, tl, cT, TOKEN, "jump", true)
+    end
+    driftMax, driftWarned = 0, false
 end
 
 -- ---- the frame ----
 local function frame(dt)
     if not (recording or playing) then return end
     if not loadModules() then return end
-    local ok, snap = pcall(CR.snapshot)
-    if not ok or type(snap) ~= "table" or type(snap.x) ~= "number" or type(snap.time) ~= "number" then
-        anchor.valid = false
-        return
-    end
-    local tl = getTimeline()
-    if not tl then anchor.valid = false; return end
-    anchor.valid, anchor.sim, anchor.clock = true, snap.time, tl.clock
+    local sT, cT, snap, tl = nowPair()
+    if not sT or type(snap.x) ~= "number" then return end
     installHooks()
 
-    local level = levelKey(snap)
+    local level = tostring(snap.id)
     if level ~= lastLevel then
         lastLevel = level
-        newAttempt(tl)
-        if playing and not macro then macro = loadMacro(level) end
-        if macro and tostring(macro.level) ~= level then macro = loadMacro(level) end
+        lastSim = nil
+        nextIdx = 1
+        clearOurEvents(tl)
+        if recording then rec = {events = {}, traj = {}} end
+        if not macro or tostring(macro.level) ~= level then macro = loadMacro(level) end
         window:Notification({Title = "level " .. level, Text = summary(macro), Duration = 3})
     end
-    -- a new attempt: the sim clock went back, or we just died
-    if (lastSim and snap.time < lastSim - 0.05) or (snap.dead and not lastDead) then
-        local wasRec = recording and not snap.dead and snap.complete
-        newAttempt(tl)
+
+    if recording and autoPractice and not snap.practice and not snap.dead and tick() - lastPracticeTry > 1 then
+        lastPracticeTry = tick()
+        pcall(CR.enterPractice)
     end
-    lastSim, lastDead = snap.time, snap.dead and true or false
+
+    -- sim clock went back: respawn at a checkpoint, or restart
+    if lastSim and sT < lastSim - 0.05 then
+        if recording then rollbackRecording(snap) end
+        if playing and macro then resyncPlayback(snap, tl) end
+    end
+    lastSim = sT
     if snap.dead or snap.paused then return end
 
     if recording then
-        rec.traj[#rec.traj + 1] = {t = snap.time, x = snap.x, y = snap.y}
-        if snap.complete then
-            macro = {level = level, events = rec.events, traj = rec.traj, length = snap.time}
+        rec.traj[#rec.traj + 1] = {t = sT, x = snap.x, y = snap.y}
+        if snap.complete or (type(snap.percent) == "number" and snap.percent >= 100) then
+            macro = {level = level, events = rec.events, traj = rec.traj, length = sT}
             recording = false
             local sok = saveMacro()
             window:Notification({Title = "macro recorded", Text = summary(macro) .. (sok and " (saved)" or " (couldn't save the file)"), Duration = 5})
@@ -288,17 +345,17 @@ local function frame(dt)
 
     if playing and macro then
         if practiceOnly and not snap.practice then
-            if not driftWarned then
-                driftWarned = true
+            if not practiceWarned then
+                practiceWarned = true
                 window:Notification({Title = "macro", Text = "playback only runs in practice mode, so bot runs dont count. turn practice mode on (or switch that off in the macro tab)", Duration = 5})
             end
             return
         end
-        -- queue what falls inside the lookahead window
+        local nudge = nudgeTicks * TICK
         while nextIdx <= #macro.events do
             local e = macro.events[nextIdx]
-            if e.t > snap.time + LOOKAHEAD then break end
-            local realT = anchor.clock + math.max(e.t - anchor.sim, 0)
+            if e.t + nudge > sT + LOOKAHEAD then break end
+            local realT = cT + math.max(e.t + nudge - sT, 0)
             if e.a == "release" then
                 pcall(origQR or RS.queueRelease, tl, realT, TOKEN)
             else
@@ -306,21 +363,21 @@ local function frame(dt)
             end
             nextIdx = nextIdx + 1
         end
-        -- is the run still on the recorded line? (the sim is deterministic, so it should be)
+        -- still on the recorded line? (the sim is deterministic, so it should be)
         local traj = macro.traj
         if traj and #traj > 0 then
             local lo, hi = 1, #traj
             while lo < hi do
                 local mid = (lo + hi) // 2
-                if traj[mid].t < snap.time then lo = mid + 1 else hi = mid end
+                if traj[mid].t < sT then lo = mid + 1 else hi = mid end
             end
             local ref = traj[lo]
-            if ref and math.abs(ref.t - snap.time) < 0.05 then
+            if ref and math.abs(ref.t - sT) < 0.05 then
                 local drift = math.abs(ref.y - snap.y)
                 if drift > driftMax then driftMax = drift end
                 if drift > 3 and not driftWarned then
                     driftWarned = true
-                    window:Notification({Title = "macro desync", Text = string.format("off the recorded line at %.2fs (y off by %.1f). tell me about it", snap.time, drift), Duration = 6})
+                    window:Notification({Title = "macro desync", Text = string.format("off the recorded line at %.2fs (y off by %.1f). try the timing nudge slider, and tell me", sT, drift), Duration = 6})
                 end
             end
         end
@@ -351,20 +408,21 @@ local infoTab = window:AddTab("InfoTab",  {Text="info",  Icon="info"})
 local macTab  = window:AddTab("MacroTab", {Text="macro", Icon="play"})
 
 local iL = infoTab:AddLeftGroupbox("IL", {Text="about"})
-iL:AddLabel("IL1",{Text="<font color='#C41E3A'><b>geometry dash macro</b></font> by woops &lt;3\n\nrecords your run and plays it back on the exact physics tick, in the game's own 240 tick/s timeline.\n\n1. open a level\n2. turn on <b>record</b> and beat the level (it keeps your latest attempt and saves it when you finish)\n3. turn on <b>play macro</b> and restart"})
+iL:AddLabel("IL1",{Text="<font color='#C41E3A'><b>geometry dash macro</b></font> by woops &lt;3\n\nrecords your run and plays it back on the exact physics tick, in the game's own 240 tick/s timeline.\n\n1. open a level\n2. turn on <b>record</b>. it puts the level in practice mode: dying is fine, the macro keeps everything up to your checkpoint and drops the failed attempt, so beat the level and it saves one clean run\n3. turn on <b>play macro</b> and restart"})
 iL:AddSeparator("ILS",{})
 iL:AddLabel("IL2",{Text="<b>right shift</b> = open / close the menu\nmacros are saved in the <b>gdmacros</b> folder, one file per level"})
 
 local mL = macTab:AddLeftGroupbox("ML", {Text="macro"})
 mL:AddToggle("Record",{
     Text="record", Value=false,
-    Tooltip="records every tap of your attempt. dying throws the attempt away and starts a new recording, finishing the level saves it",
+    Tooltip="switches to practice mode and records every tap. when you die and respawn at a checkpoint, the failed attempt after the checkpoint is dropped, so the macro stays one clean run. finishing the level saves it",
     Callback=function(val)
         recording = val
         if val then
             playing = false
             if UIPlay then UIPlay:SetValue(false) end
             rec = {events = {}, traj = {}}
+            lastSim, lastLevel = nil, nil
             startLoop()
         else
             stopLoopIfIdle()
@@ -388,10 +446,20 @@ UIPlay = mL:AddToggle("Play",{
         window:Notification({Title="macro",Text=val and ("<font color='#C41E3A'>playing</font> | " .. summary(macro)) or "stopped playing",Duration=3})
     end,
 })
+mL:AddToggle("AutoPractice",{
+    Text="auto practice when recording", Value=true,
+    Tooltip="recording puts the level in practice mode by itself, so you can die and still keep the macro",
+    Callback=function(val) autoPractice = val end,
+})
+mL:AddSlider("Nudge",{
+    Text="timing nudge (ticks)", Min=-8, Max=8, Value=0, Step=1,
+    Tooltip="shifts every playback input by this many physics ticks (1 tick = 1/240 s). leave it at 0 unless playback is off by a hair",
+    Callback=function(v) nudgeTicks = v end,
+})
 mL:AddToggle("PracticeOnly",{
     Text="practice mode only", Value=true,
     Tooltip="macro playback only runs inside practice mode, so bot runs don't count as real completions or rewards. turn it off and playback counts like a normal run, which can get you flagged",
-    Callback=function(val) practiceOnly = val; driftWarned = false end,
+    Callback=function(val) practiceOnly = val; practiceWarned = false end,
 })
 mL:AddButton("SaveNow",{
     Text="save macro now",
