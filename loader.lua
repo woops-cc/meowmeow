@@ -1,5 +1,3 @@
--- pathfinder is soon guys sTOP SPAMMING MY DMS !!!!!
--- do note that this is still IN TESTING PHASE. WILL COME WITH BUGS SO IF U FIND ANY PLEASE DM ME CONSOLE + DEBUG
 -- ui library loading. loader first, and if github breaks it again (wrong urls, classic) it
 -- grabs the lib file directly and sets it up by hand. the loader and i have trust issues
 local LOADER_URL    = "https://raw.githubusercontent.com/Null-Cherry/Fire-Library/refs/heads/main/Loader.lua"
@@ -25,13 +23,13 @@ end
 local function loadLibrary()
     local ok, res = pcall(viaLoader)
     if ok and res then return res end
-    warn("[geometry dash] the library loader failed ("..tostring(res).."), loading the library file directly")
+    warn("[geometry dash pathfinder] the library loader failed ("..tostring(res).."), loading the library file directly")
     for _, user in ipairs(LIBRARY_USERS) do
         local ok2, res2 = pcall(viaFile, user)
         if ok2 and res2 then return res2 end
-        warn(("[geometry dash] loading the library from %s failed: %s"):format(user, tostring(res2)))
+        warn(("[geometry dash pathfinder] loading the library from %s failed: %s"):format(user, tostring(res2)))
     end
-    warn("[geometry dash] couldn't load the ui library")
+    warn("[geometry dash pathfinder] couldn't load the ui library")
     return nil
 end
 
@@ -50,7 +48,7 @@ local function guard(obj, label)
         return function(_, ...)
             local ok, res = pcall(v, obj, ...)
             if not ok then
-                warn(("[geometry dash] ui: %s:%s failed: %s"):format(label, tostring(key), tostring(res)))
+                warn(("[geometry dash pathfinder] ui: %s:%s failed: %s"):format(label, tostring(key), tostring(res)))
                 res = nil
             end
             if containers[key] then return guard(res, label.."/"..tostring(key)) end
@@ -68,9 +66,9 @@ local C_BG    = Color3.fromRGB(10,  10,  12)
 local C_WHITE = Color3.fromRGB(232, 232, 236)
 
 local WINDOW_OPTIONS = {
-    Title    = "<font color='#E8E8EC'><b>geometry dash</b></font><font color='#C41E3A'> botplay</font>",
+    Title    = "<font color='#E8E8EC'><b>geometry dash pathfinder</b></font><font color='#C41E3A'> botplay</font>",
     Icon     = "125411711221424",
-    Footer   = "<font color='#C41E3A'>woops &lt;3</font>  ·  geometry dash  ·  "..VERSION,
+    Footer   = "<font color='#C41E3A'>woops &lt;3</font>  ·  geometry dash pathfinder  ·  "..VERSION,
     Keybind  = Enum.KeyCode.RightShift,
     NeonType      = "Top",
     NeonThickness = 3,
@@ -94,11 +92,11 @@ for attempt = 1, 3 do
         for k, v in pairs(WINDOW_OPTIONS) do opts[k] = v end
         opts.Image, opts.ImageEnabled, opts.Icon, opts.EnableUIBlur = nil, false, nil, false
     elseif attempt == 3 then
-        opts = {Title = "geometry dash botplay", Keybind = Enum.KeyCode.RightShift}
+        opts = {Title = "geometry dash pathfinder botplay", Keybind = Enum.KeyCode.RightShift}
     end
-    local ok, res = pcall(function() return lib:Window("gdmacro_ap", opts) end)
+    local ok, res = pcall(function() return lib:Window("gdpath_ap", opts) end)
     if ok and res then window = res; break end
-    warn(("[geometry dash] window attempt %d failed: %s"):format(attempt, tostring(res)))
+    warn(("[geometry dash pathfinder] window attempt %d failed: %s"):format(attempt, tostring(res)))
 end
 if not window then return end
 window = guard(window, "window")
@@ -130,352 +128,265 @@ end)
 
 
 
-local UIPlay
-local RunService  = game:GetService("RunService")
 local RepS        = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
 
-local TOKEN     = "gdmacro"     -- our own input source name, the game treats it like one more finger
-local LOOKAHEAD = 0.30          -- seconds of macro that get queued ahead of the sim (they wait in the game's own queue, so they land on the exact tick)
-local TICK      = 1 / 240       -- the physics runs at 240 ticks a second
-local MACRO_DIR = "gdmacros"
+local TOKEN       = "gdpath"
+local FRAME       = 1 / 60
+local MACRO_DIR   = "gdmacros"
+local epochFrames = 2            -- how many frames one decision lasts (1 = most precise, slower)
+local nodeBudget  = 400000       -- how many decisions the search may try before giving up
+local savePartial = true
+local searching, stopFlag = false, false
 
-local recording    = false
-local playing      = false
-local practiceOnly = true       -- bot runs only play inside practice mode, so they dont count as real completions
-local autoPractice = true       -- recording switches the level to practice mode by itself
-local nudgeTicks   = 0          -- manual timing shift for playback, in physics ticks
-local macro        = nil        -- {level=, events={{t=,a=,d=}}, traj={{t=,x=,y=}}, length=}
-local rec          = {events = {}, traj = {}}
-local nextIdx      = 1
-local lastSim, lastLevel = nil, nil
-local driftMax, driftWarned, practiceWarned = 0, false, false
-local lastPracticeTry = 0
-local hooked       = false
-local origQI, origQR
-local CR, RS
-local looping, lastErr = false, 0
-
--- ---- the game ----
--- the game is a full lua port of geometry dash (ReplicatedStorage.GDPort). ClientRuntime.snapshot() gives the live
--- player state and every tap goes through RuntimeSupport.queueInput(timeline, time, token, action, down) into a
--- timeline the physics eats at 240 ticks a second: a tap with a timestamp lands on the exact tick that timestamp falls in
-local function loadModules()
-    if CR and RS then return true end
-    local gd = RepS:FindFirstChild("GDPort")
-    if not gd then return false end
-    local ok1, a = pcall(require, gd:FindFirstChild("ClientRuntime"))
-    local ok2, b = pcall(require, gd:FindFirstChild("RuntimeSupport"))
-    if ok1 and ok2 and type(a) == "table" and type(b) == "table" then CR, RS = a, b; return true end
-    return false
+local gd = RepS:FindFirstChild("GDPort")
+local function req(name)
+    local m = gd and gd:FindFirstChild(name)
+    if not m then return nil end
+    local ok, r = pcall(require, m)
+    return ok and r or nil
 end
 
-local function getTimeline()
-    local gu = (debug and debug.getupvalues) or getupvalues
-    if not gu or not CR or type(CR.inputTime) ~= "function" then return nil end
-    local ok, t = pcall(gu, CR.inputTime)
-    if not ok or type(t) ~= "table" then return nil end
-    for i = 1, 12 do
-        local v = t[i]
-        if type(v) == "table" and type(rawget(v, "queue")) == "table" and type(rawget(v, "input")) == "table" and type(rawget(v, "clock")) == "number" then return v end
+-- ---- a private copy of the level's physics ----
+-- the game is a deterministic lua port of geometry dash, so the pathfinder runs the game's OWN simulation (GameLayer +
+-- Simulation) in a private copy of the level: whatever the game supports (modes, portals, orbs, triggers...) is supported
+-- here too. the level gets a copy of its mutable parts and its own layer pointer, so the live game is never touched
+local function deep(v, seen)
+    if type(v) ~= "table" then return v end
+    if seen[v] then return seen[v] end
+    local c = {}
+    seen[v] = c
+    for k, x in pairs(v) do c[k] = deep(x, seen) end
+    local mt = getmetatable(v)
+    if mt then setmetatable(c, mt) end
+    return c
+end
+
+local M = {}
+local function loadMods()
+    if M.ok then return true end
+    M.CR, M.RS, M.GL, M.Sim, M.Eff = req("ClientRuntime"), req("RuntimeSupport"), req("GameLayer"), req("Simulation"), req("Effects")
+    M.ok = M.CR and M.RS and M.GL and M.Sim and M.Eff and true or false
+    return M.ok
+end
+
+local function buildSim(setPointer)
+    local live = M.CR.layer
+    if type(live) ~= "table" or type(live.level) ~= "table" then return nil, "open a level first (you have to be inside it)" end
+    local lvl = live.level
+    local lvl2 = {}
+    for k, v in pairs(lvl) do lvl2[k] = v end
+    lvl2._lifecycleLayer = nil
+    for _, k in ipairs({"groups", "colors", "colorDefinitions", "colorAlpha", "colorBlending"}) do
+        if type(lvl[k]) == "table" then lvl2[k] = deep(lvl[k], {}) end
     end
+    setmetatable(lvl2, getmetatable(lvl))
+    local state = M.Sim.new(lvl2)
+    local eff = M.Eff.new(lvl2)
+    local input = M.RS.newInput()
+    local tl = M.RS.newTimeline(input, 0)
+    local layer = M.GL.new({level = lvl2, state = state, effects = eff, renderer = nil, shake = nil, support = M.RS, timeline = tl, clock = 0,
+        quantum = not lvl.platformer,
+        hooks = {isPaused = function() return false end, completeTimers = true, quitLevel = function() end}})
+    layer:start()
+    if setPointer then lvl2._lifecycleLayer = layer end
+    return {state = state, layer = layer, tl = tl, level = lvl2, id = tostring(M.CR.snapshot().id)}
 end
 
--- one reading of "where the sim is" and "what the timeline clock says", taken at the same instant. every conversion
--- between a tap timestamp and sim time uses a pair like this, read when it is needed (never a stale one from an earlier frame)
-local function nowPair()
-    if not CR then return nil end
-    local ok, snap = pcall(CR.snapshot)
-    local tl = getTimeline()
-    if ok and type(snap) == "table" and type(snap.time) == "number" and tl then return snap.time, tl.clock, snap, tl end
-end
-
--- adds one recorded input, skipping an exact duplicate (queueRelease may call queueInput inside the game)
-local function pushEvent(t, a, d)
-    local last = rec.events[#rec.events]
-    if last and last.a == a and last.d == d and math.abs(last.t - t) < 0.000001 then return end
-    rec.events[#rec.events + 1] = {t = t, a = a, d = d}
-end
-
-local function heldAt(events, upto)
-    local held = false
-    for i = 1, upto do
-        local e = events[i]
-        if e.a == "release" then held = false elseif e.a == "jump" then held = e.d end
-    end
-    return held
-end
-
--- recording: every real tap goes through queueInput / queueRelease, so a wrapper just writes down what passes. only reads
-local function installHooks()
-    if hooked then return end
-    hooked = true
-    origQI, origQR = RS.queueInput, RS.queueRelease
-    RS.queueInput = function(tl, time, token, action, down)
-        if recording and token ~= TOKEN and type(time) == "number" then
-            local sT, cT = nowPair()
-            if sT then pushEvent(sT + (time - cT), action, down == true) end
-        end
-        return origQI(tl, time, token, action, down)
-    end
-    RS.queueRelease = function(tl, time, token)
-        if recording and token ~= TOKEN and type(time) == "number" then
-            local sT, cT = nowPair()
-            if sT then pushEvent(sT + (time - cT), "release", false) end
-        end
-        return origQR(tl, time, token)
-    end
-end
-
-local function removeHooks()
-    if not hooked then return end
-    hooked = false
-    if RS.queueInput ~= origQI then RS.queueInput = origQI end
-    if RS.queueRelease ~= origQR then RS.queueRelease = origQR end
-end
-
--- takes our not-yet-played events out of the game's queue (rollback, macro turned off, ...)
-local function clearOurEvents(tl)
-    if not tl then return end
+local function zeroTimeline(S)
+    local tl = S.tl
+    tl.remainder, tl.debt, tl._debtTicks = 0, 0, 0
     local q = tl.queue
-    for i = #q, 1, -1 do
-        if q[i].token == TOKEN then table.remove(q, i) end
-    end
-    pcall(RS.releaseInput, tl.input, TOKEN)
-    pcall(RS.releaseInput, tl.capture, TOKEN)
+    for i = #q, 1, -1 do table.remove(q, i) end
 end
 
-local function saveMacro()
-    if not macro then return false, "no macro" end
+-- one decision = `epochFrames` frames with the finger held or not. the state is written EVERY epoch (it does nothing when
+-- nothing changed), so restoring an old state never leaves the finger in the wrong position
+local function applyEpoch(S, held)
+    for f = 1, epochFrames do
+        S.layer:steps(FRAME, f == 1 and {{TOKEN, "jump", held}} or nil)
+        if S.state.dead then return false end
+    end
+    return true
+end
+
+local function finished(S)
+    return S.state.complete == true or (type(S.layer.percent) == "number" and S.layer.percent >= 100)
+end
+
+local function selfTest(S)
+    local function run()
+        M.Sim.reset(S.state, S.cp0); zeroTimeline(S)
+        for i = 1, 40 do
+            S.layer:steps(FRAME, (i == 12 and {{TOKEN, "jump", true}}) or (i == 18 and {{TOKEN, "jump", false}}) or nil)
+        end
+        return S.state.x, S.state.y, S.state.time, S.state.dead
+    end
+    local a1, b1, c1, d1 = run()
+    local a2, b2, c2, d2 = run()
+    return a1 == a2 and b1 == b2 and c1 == c2 and d1 == d2
+end
+
+-- ---- the search ----
+-- depth first over decisions, trying "keep doing what you were doing" first. a dead end marks its state as failed so
+-- no path walks into it twice, and checkpoints let it step back without re-simulating from the start
+local function search(S, notify)
+    local state = S.state
+    local E = epochFrames
+    local path, triedF, triedT, cps, failed = {[0] = false}, {}, {}, {}, {}
+    local function key(d)
+        return string.format("%d|%.0f|%.1f|%s|%s", d, state.y or 0, state.vy or 0, tostring(state.mode), tostring(path[d]))
+    end
+    cps[0] = S.cp0
+    local function restore(d)
+        local base = d
+        while base > 0 and not cps[base] do base = base - 1 end
+        M.Sim.reset(state, cps[base]); zeroTimeline(S)
+        for e = base + 1, d do applyEpoch(S, path[e]) end
+    end
+    local depth, nodes, bestDepth, bestX = 0, 0, 0, 0
+    local lastNote, lastYield = os.clock(), os.clock()
+    local t0 = os.clock()
+    while true do
+        if finished(S) then return true, path, depth, nodes end
+        if nodes >= nodeBudget or stopFlag then return false, path, bestDepth, nodes, bestX end
+        local prev = path[depth]
+        local choice
+        if not (prev and triedT[depth + 1] or (not prev) and triedF[depth + 1]) then choice = prev
+        elseif not (prev and triedF[depth + 1] or (not prev) and triedT[depth + 1]) then choice = not prev end
+        if choice == nil then
+            failed[key(depth)] = true
+            if depth == 0 then return false, path, bestDepth, nodes, bestX end
+            cps[depth] = nil
+            triedF[depth + 1], triedT[depth + 1] = nil, nil
+            depth = depth - 1
+            restore(depth)
+        else
+            if choice then triedT[depth + 1] = true else triedF[depth + 1] = true end
+            nodes = nodes + 1
+            local ok = applyEpoch(S, choice)
+            if ok then
+                path[depth + 1] = choice
+                if failed[key(depth + 1)] then ok = false end
+            end
+            if ok then
+                depth = depth + 1
+                cps[depth] = M.Sim.checkpoint(state)
+                if cps[depth - 64] and (depth - 64) % 20 ~= 0 then cps[depth - 64] = nil end
+                if depth > bestDepth then bestDepth, bestX = depth, state.x end
+            else
+                path[depth + 1] = nil
+                restore(depth)
+            end
+        end
+        local now = os.clock()
+        if now - lastYield > 0.008 then task.wait(); lastYield = os.clock() end
+        if now - lastNote > 3 then
+            lastNote = now
+            notify(string.format("x %.0f (%.0f%%) | %d decisions | depth %d | %.0fs", bestX, (S.layer.percent or 0), nodes, depth, now - t0))
+        end
+    end
+end
+
+-- turns the winning path into macro events (times in sim seconds, a hair into the frame so they land in its first tick)
+local function toMacro(S, path, depth)
+    local events, prev = {}, false
+    for e = 1, depth do
+        if path[e] ~= prev then
+            events[#events + 1] = {t = (e - 1) * epochFrames * FRAME + 0.0005, a = "jump", d = path[e]}
+            prev = path[e]
+        end
+    end
+    if prev then events[#events + 1] = {t = depth * epochFrames * FRAME + 0.0005, a = "jump", d = false} end
+    -- replay from the start to record the line the macro player checks against, and to prove the path really finishes
+    M.Sim.reset(S.state, S.cp0); zeroTimeline(S)
+    local traj, ei, held = {}, 1, false
+    local frames = depth * epochFrames
+    for fr = 0, frames - 1 do
+        local t = fr * FRAME
+        local inp
+        while events[ei] and events[ei].t < t + FRAME do inp = {{TOKEN, "jump", events[ei].d}}; ei = ei + 1 end
+        if not inp then inp = {{TOKEN, "jump", false}} end
+        S.layer:steps(FRAME, inp)
+        traj[#traj + 1] = {t = S.state.time, x = S.state.x, y = S.state.y}
+        if S.state.dead then break end
+    end
+    return {level = S.id, events = events, traj = traj, length = S.state.time}, (not S.state.dead) and finished(S)
+end
+
+local function saveMacro(m, suffix)
     local ok, err = pcall(function()
         if makefolder and isfolder and not isfolder(MACRO_DIR) then makefolder(MACRO_DIR) end
-        writefile(MACRO_DIR .. "/level_" .. macro.level .. ".json", HttpService:JSONEncode(macro))
+        writefile(MACRO_DIR .. "/level_" .. m.level .. (suffix or "") .. ".json", HttpService:JSONEncode(m))
     end)
-    return ok, err
+    return ok
 end
 
-local function loadMacro(level)
-    local ok, res = pcall(function()
-        return HttpService:JSONDecode(readfile(MACRO_DIR .. "/level_" .. level .. ".json"))
-    end)
-    if ok and type(res) == "table" and type(res.events) == "table" then return res end
-end
-
-local function summary(m)
-    if not m then return "no macro loaded" end
-    return string.format("level %s: %d inputs over %.1fs", tostring(m.level), #m.events, m.length or 0)
-end
-
--- the sim time went backwards: you died and respawned at a checkpoint (or restarted). recording keeps everything
--- BEFORE that moment and throws away the failed attempt after it, so the macro ends up as one clean run
-local function rollbackRecording(snap)
-    local Tc = snap.time
-    local ev = rec.events
-    local keep = {}
-    for _, e in ipairs(ev) do
-        if e.t < Tc - 0.0005 then keep[#keep + 1] = e end
-    end
-    rec.events = keep
-    local traj = {}
-    for _, p in ipairs(rec.traj) do
-        if p.t < Tc - 0.0005 then traj[#traj + 1] = p end
-    end
-    rec.traj = traj
-    -- the respawn keeps whatever your finger is doing: if the events say "held" but you are not holding (or the other way round), fix it at the checkpoint
-    local actual = type(snap.inputTiming) == "table" and snap.inputTiming.held == true
-    if heldAt(rec.events, #rec.events) ~= actual then
-        rec.events[#rec.events + 1] = {t = Tc, a = "jump", d = actual}
-    end
-end
-
--- playback after a rollback: pick the macro up again from the checkpoint, with the right finger state
-local function resyncPlayback(snap, tl)
-    clearOurEvents(tl)
-    local ev = macro.events
-    local i = 1
-    while i <= #ev and ev[i].t < snap.time - 0.0005 do i = i + 1 end
-    nextIdx = i
-    if heldAt(ev, i - 1) then
-        local sT, cT = snap.time, tl.clock
-        pcall(origQI or RS.queueInput, tl, cT, TOKEN, "jump", true)
-    end
-    driftMax, driftWarned = 0, false
-end
-
--- ---- the frame ----
-local function frame(dt)
-    if not (recording or playing) then return end
-    if not loadModules() then return end
-    local sT, cT, snap, tl = nowPair()
-    if not sT or type(snap.x) ~= "number" then return end
-    installHooks()
-
-    local level = tostring(snap.id)
-    if level ~= lastLevel then
-        lastLevel = level
-        lastSim = nil
-        nextIdx = 1
-        clearOurEvents(tl)
-        if recording then rec = {events = {}, traj = {}} end
-        if not macro or tostring(macro.level) ~= level then macro = loadMacro(level) end
-        window:Notification({Title = "level " .. level, Text = summary(macro), Duration = 3})
-    end
-
-    if recording and autoPractice and not snap.practice and not snap.dead and tick() - lastPracticeTry > 1 then
-        lastPracticeTry = tick()
-        pcall(CR.enterPractice)
-    end
-
-    -- sim clock went back: respawn at a checkpoint, or restart
-    if lastSim and sT < lastSim - 0.05 then
-        if recording then rollbackRecording(snap) end
-        if playing and macro then resyncPlayback(snap, tl) end
-    end
-    lastSim = sT
-    if snap.dead or snap.paused then return end
-
-    if recording then
-        rec.traj[#rec.traj + 1] = {t = sT, x = snap.x, y = snap.y}
-        if snap.complete or (type(snap.percent) == "number" and snap.percent >= 100) then
-            macro = {level = level, events = rec.events, traj = rec.traj, length = sT}
-            recording = false
-            local sok = saveMacro()
-            window:Notification({Title = "macro recorded", Text = summary(macro) .. (sok and " (saved)" or " (couldn't save the file)"), Duration = 5})
-        end
-    end
-
-    if playing and macro then
-        if practiceOnly and not snap.practice then
-            if not practiceWarned then
-                practiceWarned = true
-                window:Notification({Title = "macro", Text = "playback only runs in practice mode, so bot runs dont count. turn practice mode on (or switch that off in the macro tab)", Duration = 5})
+local function runPathfinder()
+    if searching then return end
+    if not loadMods() then window:Notification({Title = "pathfinder", Text = "couldn't load the game's modules", Duration = 4}); return end
+    searching, stopFlag = true, false
+    task.spawn(function()
+        local function say(t) window:Notification({Title = "pathfinder", Text = t, Duration = 3}) end
+        local ok, err = pcall(function()
+            local S, e = nil, nil
+            for _, setPtr in ipairs({true, false}) do
+                S, e = buildSim(setPtr)
+                if not S then say(e or "couldn't build the simulation"); return end
+                S.cp0 = M.Sim.checkpoint(S.state)
+                if selfTest(S) then say("private simulation ready (deterministic check passed)"); break end
+                S = nil
             end
-            return
-        end
-        local nudge = nudgeTicks * TICK
-        while nextIdx <= #macro.events do
-            local e = macro.events[nextIdx]
-            if e.t + nudge > sT + LOOKAHEAD then break end
-            local realT = cT + math.max(e.t + nudge - sT, 0)
-            if e.a == "release" then
-                pcall(origQR or RS.queueRelease, tl, realT, TOKEN)
+            if not S then say("the private simulation isn't deterministic, stopping"); return end
+            M.Sim.reset(S.state, S.cp0); zeroTimeline(S)
+            local found, path, depth, nodes, bestX = search(S, say)
+            if found then
+                local m, verified = toMacro(S, path, depth)
+                local saved = saveMacro(m)
+                say(string.format("PATH FOUND: %d inputs, %.1fs, %d decisions. verified: %s. %s", #m.events, m.length, nodes, tostring(verified), saved and ("saved as level_" .. m.level .. ".json, play it with the macro tool") or "couldn't save the file"))
             else
-                pcall(origQI or RS.queueInput, tl, realT, TOKEN, e.a, e.d)
+                local m = nil
+                if savePartial and depth and depth > 0 then m = toMacro(S, path, depth); saveMacro(m, "_partial") end
+                say(string.format("no full path found (%d decisions, best x %.0f)%s", nodes or 0, bestX or 0, m and ", saved the furthest run as level_" .. m.level .. "_partial.json" or ""))
             end
-            nextIdx = nextIdx + 1
-        end
-        -- still on the recorded line? (the sim is deterministic, so it should be)
-        local traj = macro.traj
-        if traj and #traj > 0 then
-            local lo, hi = 1, #traj
-            while lo < hi do
-                local mid = (lo + hi) // 2
-                if traj[mid].t < sT then lo = mid + 1 else hi = mid end
-            end
-            local ref = traj[lo]
-            if ref and math.abs(ref.t - sT) < 0.05 then
-                local drift = math.abs(ref.y - snap.y)
-                if drift > driftMax then driftMax = drift end
-                if drift > 3 and not driftWarned then
-                    driftWarned = true
-                    window:Notification({Title = "macro desync", Text = string.format("off the recorded line at %.2fs (y off by %.1f). try the timing nudge slider, and tell me", sT, drift), Duration = 6})
-                end
-            end
-        end
-    end
-end
-
-local function startLoop()
-    if looping then return end
-    looping = true
-    RunService:BindToRenderStep("gd_macro", Enum.RenderPriority.Last.Value, function(dt)
-        local ok, err = pcall(frame, dt)
-        if not ok and tick() - lastErr > 2 then lastErr = tick(); warn("[gd macro] loop error: " .. tostring(err)) end
+        end)
+        if not ok then window:Notification({Title = "pathfinder", Text = "error: " .. tostring(err), Duration = 8}); warn("[gd pathfinder] " .. tostring(err)) end
+        searching = false
     end)
-end
-
-local function stopLoopIfIdle()
-    if recording or playing or not looping then return end
-    looping = false
-    pcall(function() RunService:UnbindFromRenderStep("gd_macro") end)
-    if CR and RS then
-        clearOurEvents(getTimeline())
-        removeHooks()
-    end
 end
 
 -- ---- ui ----
-local infoTab = window:AddTab("InfoTab",  {Text="info",  Icon="info"})
-local macTab  = window:AddTab("MacroTab", {Text="macro", Icon="play"})
+local infoTab = window:AddTab("InfoTab", {Text="info",       Icon="info"})
+local pfTab   = window:AddTab("PfTab",   {Text="pathfinder", Icon="play"})
 
 local iL = infoTab:AddLeftGroupbox("IL", {Text="about"})
-iL:AddLabel("IL1",{Text="<font color='#C41E3A'><b>geometry dash macro</b></font> by woops &lt;3\n\nrecords your run and plays it back on the exact physics tick, in the game's own 240 tick/s timeline.\n\n1. open a level\n2. turn on <b>record</b>. it puts the level in practice mode: dying is fine, the macro keeps everything up to your checkpoint and drops the failed attempt, so beat the level and it saves one clean run\n3. turn on <b>play macro</b> and restart"})
+iL:AddLabel("IL1",{Text="<font color='#C41E3A'><b>geometry dash pathfinder</b></font> by woops &lt;3\n\nsolves a level by itself. it runs the game's own physics in a private copy of the level, searches for the taps that get through, and saves them as a macro.\n\n1. open the level and stay inside it\n2. press <b>find path</b>\n3. when it says PATH FOUND, play the macro with the macro tool (practice mode)"})
 iL:AddSeparator("ILS",{})
-iL:AddLabel("IL2",{Text="<b>right shift</b> = open / close the menu\nmacros are saved in the <b>gdmacros</b> folder, one file per level"})
+iL:AddLabel("IL2",{Text="<b>right shift</b> = open / close the menu\nmacros land in the <b>gdmacros</b> folder as level_<id>.json"})
 
-local mL = macTab:AddLeftGroupbox("ML", {Text="macro"})
-mL:AddToggle("Record",{
-    Text="record", Value=false,
-    Tooltip="switches to practice mode and records every tap. when you die and respawn at a checkpoint, the failed attempt after the checkpoint is dropped, so the macro stays one clean run. finishing the level saves it",
-    Callback=function(val)
-        recording = val
-        if val then
-            playing = false
-            if UIPlay then UIPlay:SetValue(false) end
-            rec = {events = {}, traj = {}}
-            lastSim, lastLevel = nil, nil
-            startLoop()
-        else
-            stopLoopIfIdle()
-        end
-        window:Notification({Title="macro",Text=val and "<font color='#C41E3A'>recording</font>, play the level" or "stopped recording",Duration=3})
-    end,
+local pL = pfTab:AddLeftGroupbox("PL", {Text="pathfinder"})
+pL:AddButton("Find",{
+    Text="find path",
+    Tooltip="searches the whole level from the start. it keeps going until it finds a way through, runs out of decisions, or you press stop",
+    Callback=function() runPathfinder() end,
 })
-UIPlay = mL:AddToggle("Play",{
-    Text="play macro", Value=false,
-    Tooltip="plays the recorded macro for the current level, every attempt, on the same ticks",
-    Callback=function(val)
-        playing = val
-        if val then
-            recording = false
-            nextIdx = 1
-            startLoop()
-        else
-            clearOurEvents(getTimeline())
-            stopLoopIfIdle()
-        end
-        window:Notification({Title="macro",Text=val and ("<font color='#C41E3A'>playing</font> | " .. summary(macro)) or "stopped playing",Duration=3})
-    end,
+pL:AddButton("Stop",{
+    Text="stop",
+    Tooltip="stops the search (the furthest run it reached gets saved as a partial macro)",
+    Callback=function() stopFlag = true end,
 })
-mL:AddToggle("AutoPractice",{
-    Text="auto practice when recording", Value=true,
-    Tooltip="recording puts the level in practice mode by itself, so you can die and still keep the macro",
-    Callback=function(val) autoPractice = val end,
+pL:AddSlider("Epoch",{
+    Text="decision length (frames)", Min=1, Max=4, Value=2, Step=1,
+    Tooltip="how long every tap/release decision lasts. 1 is the most precise but slower, 2 is a good start. harder levels may need 1",
+    Callback=function(v) epochFrames = v end,
 })
-mL:AddSlider("Nudge",{
-    Text="timing nudge (ticks)", Min=-8, Max=8, Value=0, Step=1,
-    Tooltip="shifts every playback input by this many physics ticks (1 tick = 1/240 s). leave it at 0 unless playback is off by a hair",
-    Callback=function(v) nudgeTicks = v end,
+pL:AddSlider("Budget",{
+    Text="search budget (thousand decisions)", Min=50, Max=2000, Value=400, Step=50,
+    Tooltip="how many decisions it may try before giving up",
+    Callback=function(v) nodeBudget = v * 1000 end,
 })
-mL:AddToggle("PracticeOnly",{
-    Text="practice mode only", Value=true,
-    Tooltip="macro playback only runs inside practice mode, so bot runs don't count as real completions or rewards. turn it off and playback counts like a normal run, which can get you flagged",
-    Callback=function(val) practiceOnly = val; practiceWarned = false end,
-})
-mL:AddButton("SaveNow",{
-    Text="save macro now",
-    Tooltip="saves the macro in memory to the gdmacros folder",
-    Callback=function()
-        local ok = saveMacro()
-        window:Notification({Title="macro",Text=ok and ("saved: " .. summary(macro)) or "nothing to save",Duration=3})
-    end,
-})
-mL:AddButton("ClearMacro",{
-    Text="clear macro",
-    Tooltip="forgets the macro in memory (the saved file stays)",
-    Callback=function()
-        macro = nil
-        rec = {events = {}, traj = {}}
-        window:Notification({Title="macro",Text="cleared",Duration=2})
-    end,
+pL:AddToggle("Partial",{
+    Text="save the furthest run if it fails", Value=true,
+    Tooltip="saves how far it got as level_<id>_partial.json",
+    Callback=function(val) savePartial = val end,
 })
